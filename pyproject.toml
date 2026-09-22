@@ -1,0 +1,22 @@
+[project]
+name = "hypersearch"
+version = "0.1.0"
+description = "Permission-aware hybrid code search for Forgejo"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4",
+  "ruff>=0.13",
+]
+
+[project.scripts]
+hypersearch = "hypersearch.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
