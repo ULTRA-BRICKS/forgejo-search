@@ -1,0 +1,10 @@
+# rig.yaml — repo-level config.
+# Tickets for this repo live in its own native Forgejo Issues (UB-25).
+version: 1
+
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/forgejo-search
+    attachment_mode: native
