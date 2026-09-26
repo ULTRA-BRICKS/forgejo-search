@@ -31,10 +31,15 @@ before a word is complete. File paths use an SQLite trigram index.
 ## Permission model
 
 The public UI and API stay same-origin with Forgejo. Every request forwards the
-existing Forgejo session to the local Forgejo API and builds an allow-list from
-repositories visible to that user. All SQL search paths AND that allow-list into
-their query before ranking. AST refinement can only materialize documents that
-already passed the ACL-filtered FTS candidate query.
+existing Forgejo session cookie to Forgejo's own session-authenticated `/repo/search`
+web route -- the same route Forgejo's UI uses for its repository picker -- rather than
+the `/api/v1/*` REST API, which only accepts token/basic/oauth2 credentials and never a
+browser session cookie. That route both confirms the session is signed in (an
+anonymous or revoked session is redirected to `/user/login`, which is treated as
+unauthenticated) and returns the allow-list of repositories visible to that user. Every
+SQL search path folds that allow-list into its query before ranking. AST refinement
+can only materialize documents that already passed the ACL-filtered FTS candidate
+query.
 
 A failed or partial Forgejo visibility lookup returns an explicit error and is
 never treated as a complete permission set.
