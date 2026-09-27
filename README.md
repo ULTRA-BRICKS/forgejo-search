@@ -37,12 +37,22 @@ the `/api/v1/*` REST API, which only accepts token/basic/oauth2 credentials and 
 browser session cookie. That route both confirms the session is signed in (an
 anonymous or revoked session is redirected to `/user/login`, which is treated as
 unauthenticated) and returns the allow-list of repositories visible to that user. Every
-SQL search path folds that allow-list into its query before ranking. AST refinement
-can only materialize documents that already passed the ACL-filtered FTS candidate
-query.
+SQL search path folds that allow-list into its query before ranking.
 
-A failed or partial Forgejo visibility lookup returns an explicit error and is
-never treated as a complete permission set.
+Repository *visibility* in Forgejo is granted by access to any unit -- issues, wiki,
+projects, releases -- and is not the same as code-read access. Before any file, symbol,
+AST, or full-text hit is returned, the service separately verifies Forgejo's native
+`reqRepoCodeReader` (`unit.TypeCode`) permission for each visible, indexed repository by
+probing that same session cookie against Forgejo's own per-repo code-search web route,
+`GET /{owner}/{reponame}/search` -- the same route backing Forgejo's repository header
+search box. A `404` from that route is the only trusted deny signal; any other failure
+(timeout, `403`, a mid-check session flip, ...) fails the whole request closed rather
+than guessing. This narrower "code-allowed" scope gates file/symbol/AST/text results;
+repository-name hits still use the broader visibility allow-list, since a repository's
+existence is not itself a code disclosure. This code-ACL check only runs once there is
+an actual query to execute, so the empty-query "am I signed in?" fast path used by the
+frontend stays cheap. AST refinement can only materialize documents that already passed
+the ACL-filtered FTS candidate query.
 
 ## Development
 

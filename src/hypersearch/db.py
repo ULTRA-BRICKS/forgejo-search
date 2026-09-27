@@ -150,3 +150,29 @@ def clear_repo_documents(connection: sqlite3.Connection, repo_id: int) -> None:
         (repo_id,),
     )
     connection.execute("DELETE FROM documents WHERE repo_id=?", (repo_id,))
+
+
+# SQLite's default SQLITE_MAX_VARIABLE_NUMBER bounds how many `?` markers a
+# single statement can bind; chunking keeps a single IN(...) query well
+# under that regardless of how large a caller's candidate set is.
+_IN_CLAUSE_CHUNK_SIZE = 500
+
+
+def indexed_repo_names(connection: sqlite3.Connection, candidates: set[str]) -> set[str]:
+    """Return the subset of `candidates` that are actually indexed, querying
+    only that (already ACL/query-scoped) candidate set instead of scanning
+    the full `repos` table -- callers are expected to have already narrowed
+    `candidates` down via visibility and any query scope before calling this.
+    """
+    if not candidates:
+        return set()
+    names = sorted(candidates)
+    found: set[str] = set()
+    for start in range(0, len(names), _IN_CLAUSE_CHUNK_SIZE):
+        chunk = names[start : start + _IN_CLAUSE_CHUNK_SIZE]
+        marks = ",".join("?" for _ in chunk)
+        rows = connection.execute(
+            f"SELECT full_name FROM repos WHERE full_name IN ({marks})", chunk
+        ).fetchall()
+        found.update(row[0] for row in rows)
+    return found

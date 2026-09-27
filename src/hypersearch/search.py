@@ -48,6 +48,13 @@ class SearchHit:
         repo = "/".join(quote(part, safe="") for part in self.repo.split("/"))
         if self.kind == "repository":
             data["url"] = f"/{repo}"
+            # Repository-name-only hits are built from the broader repo-
+            # visibility set, not the narrower code-ACL set (repo existence
+            # is visible even to a viewer denied code-read access -- see
+            # `_repo_hits`'s own comment). The indexed HEAD commit SHA must
+            # not leak to such a viewer: unlike a file/code hit's URL, a
+            # repository hit's URL never needs it (just `/{repo}`).
+            data.pop("revision", None)
             return data
         encoded_revision = quote(self.revision, safe="")
         encoded_path = "/".join(quote(part, safe="") for part in Path(self.path).parts)
@@ -81,6 +88,54 @@ def _scope_clause(q: SearchQuery) -> tuple[str, list[str]]:
         clauses.append("d.language=?")
         args.append(q.lang.lower())
     return (" AND ".join(clauses) if clauses else "1"), args
+
+
+def _like_pattern_regex(pattern: str) -> re.Pattern[str]:
+    """Translate a SQL `LIKE` pattern into an equivalent, case-insensitive
+    regex. `_scope_clause` builds its `owner:` clause as `LIKE ?` with no
+    `ESCAPE` clause, so SQLite treats a literal `%`/`_` inside `q.owner`
+    itself as a wildcard, not a literal character -- this mirrors that
+    exactly, rather than treating them as literal text.
+    """
+    parts = ["^"]
+    for ch in pattern:
+        if ch == "%":
+            parts.append(".*")
+        elif ch == "_":
+            parts.append(".")
+        else:
+            parts.append(re.escape(ch))
+    parts.append("$")
+    return re.compile("".join(parts), re.IGNORECASE)
+
+
+def scoped_repos(q: SearchQuery, repos: set[str]) -> set[str]:
+    """Narrow `repos` to the subset an explicit `repo:`/`owner:` qualifier in
+    `q` could possibly match: a case-insensitive exact match for `q.repo`,
+    and for `q.owner` the exact same pattern `_scope_clause` builds for its
+    `LIKE ?` clause above (`owner.rstrip("/") + "/%"`), matched via
+    `_like_pattern_regex` so `%`/`_` wildcards behave identically to
+    SQLite's unescaped `LIKE`. Both narrow together (ANDed), exactly like
+    `_scope_clause` ANDs them into one SQL WHERE clause, when a query names
+    both. This only ever intersects, never derives repo identity: with
+    neither qualifier, `repos` is returned unchanged, since a
+    full-text/full-index query legitimately still needs every candidate as a
+    code-ACL probe target. Deliberately more permissive than `_scope_clause`
+    on case (SQLite's default `=` is case-sensitive; this is not) -- safe
+    because this only ever widens the *candidate set considered for probing*,
+    never the final result set, which is still filtered by the real,
+    case-sensitive SQL at search() time.
+    """
+    if not q.repo and not q.owner:
+        return repos
+    candidates = repos
+    if q.repo:
+        target = q.repo.lower()
+        candidates = {repo for repo in candidates if repo.lower() == target}
+    if q.owner:
+        pattern = _like_pattern_regex(q.owner.rstrip("/") + "/%")
+        candidates = {repo for repo in candidates if pattern.match(repo)}
+    return candidates
 
 
 def _repo_hits(
@@ -569,22 +624,34 @@ def search(
     allowed: set[str],
     limit: int = 30,
     ast_grep: str = "ast-grep",
+    *,
+    # Narrows every hit type EXCEPT repository-name hits to the subset of
+    # `allowed` the caller can actually read code from (Forgejo's
+    # reqRepoCodeReader / unit.TypeCode, verified upstream by
+    # ForgejoAuth.code_readable_repositories before this is called). `None`
+    # (the default) means "no narrower than repo visibility" -- this is what
+    # cli.py's local `query` subcommand relies on: it is a trusted,
+    # local/offline entry point operated by whoever passes `--allow` directly
+    # on the command line, not a network-facing surface, so it intentionally
+    # never has a code-ACL layer to narrow against.
+    code_allowed: set[str] | None = None,
 ) -> dict:
     q = parse_query(query)
     limit = max(1, min(int(limit), 100))
     if not allowed:
         return {"query": q.raw, "mode": q.mode, "results": []}
 
+    code_scope = allowed if code_allowed is None else (allowed & code_allowed)
     hits: list[SearchHit] = []
     with database.connection() as connection:
         hits.extend(_repo_hits(connection, q, allowed, limit))
-        if q.file_candidate:
-            hits.extend(_file_hits(connection, q, allowed, limit))
-        if q.symbol_candidate and q.symbol_role != "reference":
-            hits.extend(_symbol_hits(connection, q, allowed, limit))
+        if q.file_candidate and code_scope:
+            hits.extend(_file_hits(connection, q, code_scope, limit))
+        if q.symbol_candidate and q.symbol_role != "reference" and code_scope:
+            hits.extend(_symbol_hits(connection, q, code_scope, limit))
         rows = (
-            _fts_rows(connection, q, allowed, max(limit, 40))
-            if q.text and q.mode != "file"
+            _fts_rows(connection, q, code_scope, max(limit, 40))
+            if q.text and q.mode != "file" and code_scope
             else []
         )
         if q.symbol_role == "reference":
@@ -593,7 +660,11 @@ def search(
         else:
             hits.extend(_fts_hits(rows[:limit], q))
         if q.ast_candidate:
-            ast_rows = rows or _ast_scope_rows(connection, q, allowed, max(limit, 40))
+            ast_rows = rows or (
+                _ast_scope_rows(connection, q, code_scope, max(limit, 40))
+                if code_scope
+                else []
+            )
             hits.extend(_signature_hits(ast_rows, q))
             hits.extend(_ast_hits(ast_rows, q, limit, ast_grep))
 
