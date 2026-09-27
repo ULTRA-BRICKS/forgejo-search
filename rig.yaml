@@ -1,0 +1,16 @@
+# rig.yaml — declarative setup for this repo, applied by `rig apply`.
+# Global defaults live at ~/.config/rig/config.yaml; this file overrides them.
+# Schema: rig-cli docs/config-schema.md
+
+version: 1
+
+# CI on Forgejo (runs-on: ubuntu-latest). The gate from the rig catalog is the ecosystem secret
+# scan: gitleaks over the tree on every pull request and on pushes to main. The repo's own ci.yml
+# runs ruff and the pytest suite.
+ci:
+  enabled: true
+  all: false
+  items:
+    secret-scan:
+      enabled: true
+      tier: block
