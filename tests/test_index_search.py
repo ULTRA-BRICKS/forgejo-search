@@ -339,3 +339,113 @@ def test_intent_ranking_prefers_repository_name_over_text_occurrences(tmp_path):
     index_all(db, root)
     result = search(db, "demo", {"acme/demo"})
     assert result["results"][0]["kind"] == "repository"
+
+
+def test_repository_visibility_does_not_imply_code_visibility(tmp_path):
+    # A user can be repo-visible (any unit: issues, wiki, projects...)
+    # without being code-readable (Forgejo's reqRepoCodeReader/unit.TypeCode).
+    # code_allowed=set() simulates a repo-visible-but-code-denied user: the
+    # repository still exists to them (repo-name hits keep using `allowed`),
+    # but no file/symbol/AST/text content may be disclosed.
+    root = fixture_repo(tmp_path)
+    db = open_database(tmp_path / "search.db")
+    index_all(db, root)
+    visible = {"acme/demo"}
+
+    repo_result = search(db, "demo", visible, code_allowed=set())
+    assert any(hit["kind"] == "repository" for hit in repo_result["results"])
+
+    file_result = search(db, "focus.js", visible, code_allowed=set())
+    assert file_result["results"] == []
+
+    symbol_result = search(db, "restoreFocus", visible, code_allowed=set())
+    assert symbol_result["results"] == []
+
+    ast_result = search(db, "restoreFocus(trigger)", visible, code_allowed=set())
+    assert ast_result["results"] == []
+
+
+def test_code_allowed_none_defaults_to_full_repo_visibility(tmp_path):
+    # cli.py's local `query` subcommand never passes code_allowed -- it must
+    # keep behaving exactly as before this feature existed.
+    root = fixture_repo(tmp_path)
+    db = open_database(tmp_path / "search.db")
+    index_all(db, root)
+    result = search(db, "restoreFocus", {"acme/demo"})
+    assert result["results"][0]["kind"] == "definition"
+
+
+def test_repository_hit_to_dict_omits_revision_but_code_hit_keeps_it():
+    from hypersearch.search import SearchHit
+
+    repo_hit = SearchHit(
+        repo="acme/demo",
+        path="",
+        language="",
+        line=0,
+        kind="repository",
+        score=1.0,
+        snippet="",
+        mode="text",
+        revision="deadbeefcafe",
+    )
+    code_hit = SearchHit(
+        repo="acme/demo",
+        path="src/focus.js",
+        language="javascript",
+        line=1,
+        kind="code",
+        score=1.0,
+        snippet="restoreFocus",
+        mode="text",
+        revision="deadbeefcafe",
+    )
+    # A repository-name-only hit must never disclose the indexed HEAD SHA --
+    # its URL never needs it (just /{repo}), unlike a code hit's pinned
+    # /src/commit/<revision>/<path> URL, which correctly keeps it.
+    assert "revision" not in repo_hit.to_dict()
+    assert code_hit.to_dict()["revision"] == "deadbeefcafe"
+
+
+def test_scoped_repos_narrows_by_repo_and_owner_qualifiers():
+    from hypersearch.query import parse_query
+    from hypersearch.search import scoped_repos
+
+    repos = {"acme/open", "acme/locked", "other/thing"}
+
+    # No repo:/owner: qualifier -> every candidate stays (a full-text query
+    # still needs every visible+indexed repo as a probe target).
+    assert scoped_repos(parse_query("anything"), repos) == repos
+
+    # repo: narrows to an exact, case-insensitive match.
+    assert scoped_repos(parse_query("repo:ACME/Open anything"), repos) == {"acme/open"}
+
+    # owner: narrows to a case-insensitive prefix match.
+    assert scoped_repos(parse_query("owner:ACME anything"), repos) == {
+        "acme/open",
+        "acme/locked",
+    }
+
+    # Both together AND, exactly like _scope_clause ANDs them into one SQL
+    # WHERE clause.
+    assert scoped_repos(parse_query("repo:acme/open owner:acme anything"), repos) == {
+        "acme/open"
+    }
+    assert scoped_repos(parse_query("repo:acme/open owner:other anything"), repos) == set()
+
+
+def test_scoped_repos_owner_wildcard_matches_like_scope_clause_sql():
+    # _scope_clause builds `r.full_name LIKE ?` with an unescaped pattern --
+    # a literal '%'/'_' in q.owner is itself a SQL wildcard, not literal
+    # text. scoped_repos must treat it identically, or it silently
+    # under-narrows away a repo the real SQL query would still match.
+    from hypersearch.query import parse_query
+    from hypersearch.search import scoped_repos
+
+    repos = {"acmeXevil/repo", "acme/repo", "unrelated/repo"}
+    query = parse_query("owner:acme%evil anything")
+    # SQL LIKE 'acme%evil/%': '%' matches zero-or-more characters, so
+    # "acmeXevil/repo" matches; "acme/repo" has no "evil" segment so it does
+    # not -- a literal-text interpretation of '%' would wrongly match
+    # neither.
+    assert scoped_repos(query, repos) == {"acmeXevil/repo"}

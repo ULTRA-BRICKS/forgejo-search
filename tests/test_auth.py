@@ -83,6 +83,58 @@ def test_visible_repositories_authenticates_via_session_web_route_not_rest_api()
         thread.join(timeout=2)
 
 
+def test_code_readable_repositories_against_a_real_http_server():
+    """Every other code-ACL test stubs `_head` directly; this proves the real
+    `self._opener` (built with `_NoRedirect` and no ambient proxy) actually
+    serves a HEAD request correctly for `/{owner}/{reponame}/search` and
+    surfaces a `reqSignIn`-style login redirect as an `HTTPError` rather than
+    silently following it -- the same guarantee
+    `test_auth_opener_disables_proxies_and_redirects_session_cookie` proves
+    generically, applied to the actual code-ACL request shape.
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class FakeForgejo(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_HEAD(self):
+            cookie = self.headers.get("Cookie", "")
+            if self.path == "/acme/code/search":
+                if cookie != "session=valid-session-cookie":
+                    self.send_response(302)
+                    self.send_header("Location", "/user/login")
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                return
+            if self.path == "/acme/issues-only/search":
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(500)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeForgejo)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        auth = ForgejoAuth(base=f"http://127.0.0.1:{server.server_port}", ttl=30)
+        assert auth.code_readable_repositories(
+            "session=valid-session-cookie", {"acme/code", "acme/issues-only"}
+        ) == {"acme/code"}
+        # A revoked/anonymous session mid-check must surface as unavailable,
+        # not be silently followed to the login page and treated as a 200.
+        with pytest.raises(VisibilityUnavailable):
+            auth.code_readable_repositories("session=revoked", {"acme/code"})
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 def _search_payload(full_names):
     return {
         "ok": True,
@@ -563,3 +615,359 @@ def test_more_than_1000_visible_repos_fail_closed():
     auth = ThousandReposAuth(overflow=True)
     with pytest.raises(VisibilityUnavailable):
         auth.visible_repositories("alice")
+
+
+class CodeRouteAuth(ForgejoAuth):
+    def __init__(self, **kwargs):
+        kwargs.setdefault("ttl", 30)
+        kwargs.setdefault("negative_ttl", 5)
+        super().__init__(**kwargs)
+        self.code_calls = []
+
+    def _head(self, path, cookie):
+        self.code_calls.append((path, cookie))
+        if "/acme/issues-only/" in path:
+            return 404
+        if "/acme/outage/" in path:
+            raise urllib.error.URLError("temporary")
+        return 200
+
+
+def test_code_readable_repositories_uses_native_code_reader_route():
+    auth = CodeRouteAuth()
+    allowed = auth.code_readable_repositories(
+        "session=alice", {"acme/code", "acme/issues-only"}
+    )
+    assert allowed == {"acme/code"}
+    assert {path for path, _ in auth.code_calls} == {
+        "/acme/code/search",
+        "/acme/issues-only/search",
+    }
+
+
+def test_code_acl_transport_failure_fails_whole_call_closed_not_partial():
+    auth = CodeRouteAuth()
+    with pytest.raises(VisibilityUnavailable):
+        auth.code_readable_repositories("session=alice", {"acme/code", "acme/outage"})
+
+
+def test_code_acl_rejects_untrusted_repo_names_before_any_request():
+    auth = CodeRouteAuth()
+    with pytest.raises(VisibilityUnavailable):
+        auth.code_readable_repositories("session=alice", {"acme/code", "bad/../escape"})
+    assert auth.code_calls == []
+
+
+def test_code_acl_rejects_repo_names_with_extra_segments_or_bad_chars():
+    auth = CodeRouteAuth()
+    for bad in ("acme/nested/extra", "acme/weird name", "acme/caf\u00e9%20x"):
+        with pytest.raises(VisibilityUnavailable):
+            auth.code_readable_repositories("session=alice", {bad})
+    assert auth.code_calls == []
+
+
+def test_code_acl_rejects_dot_only_path_segments():
+    # The owner/repo charset alone (letters, digits, "_.-") still allows a
+    # segment made entirely of dots; quote() never percent-encodes "." (an
+    # RFC 3986 unreserved char), so an unfiltered ".." would build a literal
+    # "/acme/../search" traversal path. Must be rejected before any request.
+    auth = CodeRouteAuth()
+    for bad in ("acme/..", "acme/.", "../acme", "./acme"):
+        with pytest.raises(VisibilityUnavailable):
+            auth.code_readable_repositories("session=alice", {bad})
+    assert auth.code_calls == []
+
+
+def test_code_acl_empty_cookie_or_repos_short_circuits_without_requests():
+    auth = CodeRouteAuth()
+    assert auth.code_readable_repositories("", {"acme/code"}) == set()
+    assert auth.code_readable_repositories("session=alice", set()) == set()
+    assert auth.code_calls == []
+
+
+class ForbiddenCodeAuth(ForgejoAuth):
+    def __init__(self):
+        super().__init__(ttl=30, negative_ttl=5)
+
+    def _head(self, path, cookie):
+        raise urllib.error.HTTPError(path, 403, "forbidden", {}, None)
+
+
+def test_code_acl_403_is_unavailable_not_denied():
+    # Mirrors test_page_one_403_is_unavailable_not_unauthenticated: a
+    # WAF/proxy/IP block answering 403 for a fully signed-in, code-reading
+    # user must fail closed as unavailable, never be cached as a denial.
+    auth = ForbiddenCodeAuth()
+    with pytest.raises(VisibilityUnavailable):
+        auth.code_readable_repositories("session=alice", {"acme/code"})
+    assert not auth._code_cache
+
+
+class RevokedMidCodeCheckAuth(ForgejoAuth):
+    def __init__(self):
+        super().__init__(ttl=30, negative_ttl=5)
+
+    def _head(self, path, cookie):
+        raise urllib.error.HTTPError(
+            path, 302, "redirect to /user/login", {"Location": "/user/login"}, None
+        )
+
+
+def test_code_acl_login_redirect_mid_check_is_unavailable_not_downgraded():
+    # The session that visible_repositories() just proved authenticated a
+    # moment ago is no longer valid. Surprising/inconsistent mid-check --
+    # must not be silently reinterpreted as an anonymous deny from inside
+    # this per-repo helper.
+    auth = RevokedMidCodeCheckAuth()
+    with pytest.raises(VisibilityUnavailable):
+        auth.code_readable_repositories("session=alice", {"acme/code"})
+    assert not auth._code_cache
+
+
+class DirectUnauthorizedCodeAuth(ForgejoAuth):
+    def __init__(self):
+        super().__init__(ttl=30, negative_ttl=5)
+
+    def _head(self, path, cookie):
+        raise urllib.error.HTTPError(path, 401, "unauthorized", {}, None)
+
+
+def test_code_acl_401_mid_check_is_unavailable():
+    auth = DirectUnauthorizedCodeAuth()
+    with pytest.raises(VisibilityUnavailable):
+        auth.code_readable_repositories("session=alice", {"acme/code"})
+
+
+def test_code_acl_caches_positive_and_negative_results_within_ttl_window():
+    auth = CodeRouteAuth()
+    assert auth.code_readable_repositories("session=alice", {"acme/code"}) == {
+        "acme/code"
+    }
+    assert (
+        auth.code_readable_repositories("session=alice", {"acme/issues-only"})
+        == set()
+    )
+    calls_after_first_round = len(auth.code_calls)
+    # Repeat calls within ttl/negative_ttl must not re-request either result.
+    assert auth.code_readable_repositories("session=alice", {"acme/code"}) == {
+        "acme/code"
+    }
+    assert (
+        auth.code_readable_repositories("session=alice", {"acme/issues-only"})
+        == set()
+    )
+    assert len(auth.code_calls) == calls_after_first_round
+
+
+def test_code_acl_ttl_windows_match_visibility_cache_exactly():
+    import time
+
+    auth = CodeRouteAuth(ttl=0.05, negative_ttl=0.05)
+    auth.code_readable_repositories("session=alice", {"acme/code"})
+    auth.code_readable_repositories("session=alice", {"acme/issues-only"})
+    calls_before = len(auth.code_calls)
+    time.sleep(0.08)
+    # Once self.ttl/self.negative_ttl elapse, both the positive and negative
+    # cache entries must expire and be re-checked -- not a separate, shorter,
+    # hardcoded cap.
+    auth.code_readable_repositories("session=alice", {"acme/code", "acme/issues-only"})
+    assert len(auth.code_calls) == calls_before + 2
+
+
+class FlippingCodeAuth(ForgejoAuth):
+    def __init__(self):
+        super().__init__(ttl=30, negative_ttl=30)
+        self.code_calls = []
+        self.denied = False
+
+    def _head(self, path, cookie):
+        self.code_calls.append(path)
+        return 404 if self.denied else 200
+
+
+def test_code_acl_revocation_after_cache_expiry_flips_result():
+    auth = FlippingCodeAuth()
+    auth.ttl = 0.05
+    assert auth.code_readable_repositories("session=alice", {"acme/code"}) == {
+        "acme/code"
+    }
+    auth.denied = True
+    # Still within the ttl window -- must not re-request or flip yet.
+    assert auth.code_readable_repositories("session=alice", {"acme/code"}) == {
+        "acme/code"
+    }
+    import time
+
+    time.sleep(0.08)
+    assert auth.code_readable_repositories("session=alice", {"acme/code"}) == set()
+    assert len(auth.code_calls) == 2
+
+
+class BoundedConcurrencyCodeAuth(ForgejoAuth):
+    def __init__(self, delay=0.05):
+        import threading
+
+        super().__init__(ttl=30, negative_ttl=5)
+        self.delay = delay
+        self.lock = threading.Lock()
+        self.in_flight = 0
+        self.peak = 0
+
+    def _head(self, path, cookie):
+        import time
+
+        with self.lock:
+            self.in_flight += 1
+            self.peak = max(self.peak, self.in_flight)
+        time.sleep(self.delay)
+        with self.lock:
+            self.in_flight -= 1
+        return 200
+
+
+def test_code_acl_concurrency_is_bounded_not_unbounded_or_serial():
+    import time
+
+    auth = BoundedConcurrencyCodeAuth(delay=0.05)
+    repos = {f"acme/r{i}" for i in range(16)}
+    started = time.perf_counter()
+    allowed = auth.code_readable_repositories("session=alice", repos)
+    elapsed = time.perf_counter() - started
+    assert allowed == repos
+    # 16 repos at max_workers=8 -> two waves of ~0.05s each, well under a
+    # fully serial 16 * 0.05s = 0.8s, but genuinely bounded, not a single wave.
+    assert elapsed < 0.35
+    assert 1 < auth.peak <= 8
+
+
+def test_code_acl_same_repo_check_is_single_flight():
+    import concurrent.futures
+    import threading
+    import time
+
+    class SlowCodeAuth(ForgejoAuth):
+        def __init__(self):
+            super().__init__(ttl=30, negative_ttl=5)
+            self.calls = []
+            self.lock = threading.Lock()
+
+        def _head(self, path, cookie):
+            with self.lock:
+                self.calls.append(path)
+            time.sleep(0.03)
+            return 200
+
+    auth = SlowCodeAuth()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: auth.code_readable_repositories(
+                    "session=alice", {"acme/code"}
+                ),
+                range(8),
+            )
+        )
+    assert results == [{"acme/code"}] * 8
+    # Single-flight: only the leader caller actually probes the repo; every
+    # other concurrent caller waits on that in-flight check instead of each
+    # re-issuing its own duplicate HEAD request.
+    assert auth.calls.count("/acme/code/search") == 1
+
+
+def test_code_acl_fails_fast_by_cancelling_pending_probes_on_first_error():
+    import threading
+    import time
+
+    class FailFastAuth(ForgejoAuth):
+        def __init__(self, delay):
+            super().__init__(ttl=30, negative_ttl=5, request_timeout=5.0)
+            self.delay = delay
+            self.started = 0
+            self.lock = threading.Lock()
+
+        def _head(self, path, cookie):
+            with self.lock:
+                self.started += 1
+            if "/acme/aaa_bad/" in path:
+                raise urllib.error.HTTPError(path, 500, "boom", {}, None)
+            time.sleep(self.delay)
+            return 200
+
+    # Repos are dispatched in sorted order, so "acme/aaa_bad" sorts first and
+    # is guaranteed to be in the first wave of 8 concurrent probes -- making
+    # the outcome deterministic instead of racing on set iteration order.
+    auth = FailFastAuth(delay=0.2)
+    repos = {"acme/aaa_bad"} | {f"acme/good{i:02d}" for i in range(16)}
+    with pytest.raises(VisibilityUnavailable):
+        auth.code_readable_repositories("session=alice", repos)
+    # Only the first wave (8: acme/aaa_bad + 7 good) is guaranteed to start;
+    # a freed worker thread may grab one more item before the main thread's
+    # cancellation loop runs, but the remaining queued probes (at least 8 of
+    # the 9 originally pending) must never start.
+    assert auth.started <= 10
+
+
+def test_code_acl_probe_budget_fails_closed_without_waiting_full_fanout():
+    import threading
+    import time
+
+    class NeverRespondingAuth(ForgejoAuth):
+        def __init__(self, budget):
+            super().__init__(ttl=30, negative_ttl=5, code_probe_budget=budget)
+            self.never = threading.Event()
+
+        def _head(self, path, cookie):
+            # Blocks well past code_probe_budget -- bounded by an Event
+            # timeout only so a still-running background probe thread can't
+            # keep the test process alive indefinitely, not because the
+            # deadline logic under test is expected to let it run this long.
+            self.never.wait(timeout=2.0)
+            return 200
+
+    auth = NeverRespondingAuth(budget=0.1)
+    repos = {f"acme/r{i}" for i in range(16)}
+    started = time.perf_counter()
+    with pytest.raises(VisibilityUnavailable) as excinfo:
+        auth.code_readable_repositories("session=alice", repos)
+    elapsed = time.perf_counter() - started
+    # Must fail well before what waiting out the full fan-out (16 repos / 8
+    # workers, each hanging up to 2s) would take -- a generous margin above
+    # the 0.1s budget to avoid CI scheduling flakiness while still clearly
+    # distinguishing "budget enforced" from "fan-out completed".
+    assert elapsed < 1.0
+    assert "0.1" in str(excinfo.value)
+    assert "pending" in str(excinfo.value)
+
+
+def test_code_cache_max_entries_bounds_independently_of_max_entries():
+    # A large max_entries (the separate, cookie-only visibility cache's
+    # bound) must never leak into the code-ACL cache: it gets its own,
+    # independently-enforced code_cache_max_entries bound.
+    auth = ForgejoAuth(max_entries=10_000, code_cache_max_entries=5)
+    auth._head = lambda path, cookie: 200
+    for i in range(50):
+        auth.code_readable_repositories("session=alice", {f"acme/r{i}"})
+    assert len(auth._code_cache) <= 5
+
+
+def test_code_acl_fully_cached_skips_threadpool_executor(monkeypatch):
+    import hypersearch.auth as auth_module
+
+    auth = ForgejoAuth()
+    auth._head = lambda path, cookie: 200
+    # Warm the cache for both repos via a real (uninstrumented) fan-out.
+    auth.code_readable_repositories("session=alice", {"acme/a", "acme/b"})
+
+    created = []
+    original = auth_module.ThreadPoolExecutor
+
+    def spy(*args, **kwargs):
+        created.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(auth_module, "ThreadPoolExecutor", spy)
+    result = auth.code_readable_repositories("session=alice", {"acme/a", "acme/b"})
+    assert result == {"acme/a", "acme/b"}
+    # Every candidate resolved from cache -- the fast path must return
+    # without ever constructing a ThreadPoolExecutor.
+    assert created == []
