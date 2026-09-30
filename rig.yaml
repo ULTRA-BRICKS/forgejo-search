@@ -4,6 +4,14 @@
 
 version: 1
 
+# Tickets for this repo are native Forgejo issues on ultrabricks/forgejo-search (task-cli and rig read this).
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/forgejo-search
+    attachment_mode: native
+
 # CI on Forgejo (runs-on: ubuntu-latest). The gate from the rig catalog is the ecosystem secret
 # scan: gitleaks over the tree on every pull request and on pushes to main. The repo's own ci.yml
 # runs ruff and the pytest suite.
