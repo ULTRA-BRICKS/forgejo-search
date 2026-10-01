@@ -1,3 +1,9 @@
+"""Bounded indexed search for the authenticated HTTP handler and offline CLI.
+
+Callers supply repository visibility and the narrower code-read scope. Sentinels
+must use those same scopes; coverage never describes denied indexed contents.
+"""
+
 from __future__ import annotations
 
 import json
@@ -66,7 +72,7 @@ class SearchHit:
 
 
 def _allowed_clause(allowed: set[str]) -> tuple[str, list[str]]:
-    # Defense in depth: search() already rejects empty ACLs before SQL.
+    # Empty code scopes must remain hard SQL denials, including sentinels.
     if not allowed:
         return "0", []
     marks = ",".join("?" for _ in allowed)
@@ -139,6 +145,32 @@ def scoped_repos(q: SearchQuery, repos: set[str]) -> set[str]:
     return candidates
 
 
+def empty_coverage(limit: int = 30) -> dict:
+    limit = max(1, min(int(limit), 100))
+    return {
+        "version": 1,
+        "scope": "authorized_indexed_default_branch",
+        "completeness": "bounded",
+        "semantics": {"definitions": "pattern_based", "references": "lexical"},
+        "ast": {"status": "not_requested"},
+        "limits": {
+            name: {"limit": cap, "state": "not_applicable"}
+            for name, cap in (
+                ("repository_hits", min(limit, 12)),
+                ("file_hits", limit),
+                ("symbol_hits", limit),
+                ("lexical_candidates", max(limit, 40)),
+                ("ast_files", 20),
+                ("results", limit),
+            )
+        },
+    }
+
+
+def _limit_state(count: int, limit: int) -> str:
+    return "truncated" if count > limit else "complete"
+
+
 def _repo_hits(
     connection: sqlite3.Connection,
     q: SearchQuery,
@@ -166,7 +198,7 @@ def _repo_hits(
               END,
               length(r.full_name),r.full_name
             LIMIT ?""",
-        [*args, f"%{needle}%", needle, needle, f"%/{needle}%", min(limit, 12)],
+        [*args, f"%{needle}%", needle, needle, f"%/{needle}%", limit],
     ).fetchall()
     return [
         SearchHit(
@@ -295,10 +327,8 @@ def _fts_rows(
     q: SearchQuery,
     allowed: set[str],
     limit: int,
+    terms: list[str],
 ) -> list[sqlite3.Row]:
-    terms = _candidate_terms(q)
-    if not terms:
-        return []
     pieces: list[str] = []
     for index, term in enumerate(terms):
         escaped = term.replace('"', '""')
@@ -339,7 +369,7 @@ def _ast_scope_rows(
             JOIN repos r ON r.id=d.repo_id
             WHERE {clause} AND {scope}
             ORDER BY d.id,c.line_start LIMIT ?""",
-        [*args, *scope_args, min(limit, 120)],
+        [*args, *scope_args, limit],
     ).fetchall()
 
 
@@ -378,14 +408,16 @@ def _reference_hits(
         re.IGNORECASE,
     )
     hits: list[SearchHit] = []
+    seen: set[tuple[str, str, int]] = set()
     for row in rows:
         for offset, line in enumerate(str(row["content"]).splitlines()):
             if not identifier.search(line):
                 continue
             line_no = int(row["line_start"]) + offset
             key = (row["full_name"], row["path"], line_no)
-            if key in definitions:
+            if key in definitions or key in seen:
                 continue
+            seen.add(key)
             hit = _hit(
                 row,
                 kind="reference",
@@ -402,10 +434,11 @@ def _reference_hits(
     return hits
 
 
-def _fts_hits(rows: list[sqlite3.Row], q: SearchQuery) -> list[SearchHit]:
+def _fts_hits(rows: list[sqlite3.Row], q: SearchQuery, limit: int) -> list[SearchHit]:
     kind = "reference" if q.symbol_role == "reference" else "code"
     first = next(iter(lexical_terms(q.text)), "")
     hits: list[SearchHit] = []
+    seen: set[tuple[str, str, int]] = set()
     for row in rows:
         offset = 0
         if first:
@@ -413,15 +446,22 @@ def _fts_hits(rows: list[sqlite3.Row], q: SearchQuery) -> list[SearchHit]:
             pos = folded.find(first.casefold())
             if pos >= 0:
                 offset = folded.count("\n", 0, pos)
+        line = int(row["line_start"]) + offset
+        key = (row["full_name"], row["path"], line)
+        if key in seen:
+            continue
+        seen.add(key)
         hits.append(
             _hit(
                 row,
                 kind=kind,
                 score=_BASE_SCORE["text"] + min(9.0, max(0.0, -float(row["rank"]))),
                 mode="text",
-                line=int(row["line_start"]) + offset,
+                line=line,
             )
         )
+        if len(hits) >= limit:
+            break
     return hits
 
 
@@ -543,19 +583,27 @@ def _ast_hits(
     rows: list[sqlite3.Row],
     q: SearchQuery,
     limit: int,
-    ast_grep: str = "ast-grep",
-) -> list[SearchHit]:
-    executable = shutil.which(ast_grep) if "/" not in ast_grep else ast_grep
-    if not rows or not executable or not Path(executable).exists():
-        return []
-
+    ast_grep: str,
+    candidates_complete: bool,
+) -> tuple[list[SearchHit], str, str]:
+    if not rows:
+        return [], "no_candidates", "complete"
     unique: dict[tuple[str, str], sqlite3.Row] = {}
     for row in rows:
         unique.setdefault((row["full_name"], row["path"]), row)
-        if len(unique) >= 20:
+        if len(unique) > 20:
             break
+    # A capped chunk prefix cannot establish file exhaustion. In particular,
+    # FTS rank uses corpus statistics, so its distinct-path count is not safe
+    # coverage evidence when inaccessible documents can reorder that prefix.
+    files_state = (
+        _limit_state(len(unique), 20) if candidates_complete else "unknown"
+    )
+    executable = shutil.which(ast_grep) if "/" not in ast_grep else ast_grep
+    if not executable or not Path(executable).is_file():
+        return [], "unavailable", files_state
 
-    selected = list(unique.values())
+    selected = list(unique.values())[:20]
     contents = _candidate_blob_texts(selected)
     with tempfile.TemporaryDirectory(prefix="hypersearch-ast-") as tmp:
         root = Path(tmp).resolve()
@@ -572,9 +620,12 @@ def _ast_hits(
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
             mapping[str(target)] = row
+        if len(mapping) != len(selected):
+            files_state = "unknown" if files_state != "truncated" else files_state
         if not mapping:
-            return []
-        return _run_ast(root, mapping, q, limit, executable)
+            return [], "failed", files_state
+        hits, status = _run_ast(root, mapping, q, limit, executable)
+        return hits, status, files_state
 
 
 def _run_ast(
@@ -583,7 +634,8 @@ def _run_ast(
     q: SearchQuery,
     limit: int,
     ast_grep: str,
-) -> list[SearchHit]:
+) -> tuple[list[SearchHit], str]:
+    deadline = time.monotonic() + 2
     try:
         process = subprocess.run(
             [
@@ -602,33 +654,60 @@ def _run_ast(
             timeout=2,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return []
+    except subprocess.TimeoutExpired:
+        return [], "timeout"
+    except OSError:
+        return [], "unavailable"
+    except UnicodeError:
+        return [], "failed"
+    # ast-grep run --json=stream returns zero even for no matches.
+    if process.returncode != 0:
+        return [], "failed"
 
     hits: list[SearchHit] = []
-    for raw in process.stdout.splitlines():
+    seen: set[tuple[str, str, int]] = set()
+    resolved_files: dict[str, sqlite3.Row] = {}
+    # JSON-stream framing is LF, not Unicode's broader splitlines boundaries.
+    for record in re.finditer(r"[^\n]+", process.stdout):
+        if time.monotonic() >= deadline:
+            return [], "timeout"
+        raw = record.group()
         try:
             item = json.loads(raw)
-        except json.JSONDecodeError:
+            filename = item["file"]
+            if not isinstance(filename, str):
+                return [], "failed"
+            start = item["range"]["start"]["line"]
+            if type(start) is not int or start < 0:
+                return [], "failed"
+            row = resolved_files.get(filename)
+            if row is None:
+                raw_file = Path(filename)
+                resolved = (raw_file if raw_file.is_absolute() else root / raw_file).resolve()
+                row = mapping.get(str(resolved))
+                if row is None:
+                    return [], "failed"
+                resolved_files[filename] = row
+        except (ValueError, TypeError, KeyError, OSError):
+            return [], "failed"
+        key = (row["full_name"], row["path"], start)
+        if key in seen:
             continue
-        raw_file = Path(str(item.get("file", "")))
-        resolved = (raw_file if raw_file.is_absolute() else root / raw_file).resolve()
-        row = mapping.get(str(resolved))
-        if row is None:
-            continue
-        start = item.get("range", {}).get("start", {}).get("line", 0)
+        seen.add(key)
         hits.append(
             _hit(
                 row,
                 kind="structure",
                 score=_BASE_SCORE["ast"] - len(hits) * 0.01,
                 mode="ast",
-                line=int(start) + 1,
+                line=start + 1,
             )
         )
         if len(hits) >= limit:
             break
-    return hits
+    if time.monotonic() >= deadline:
+        return [], "timeout"
+    return hits, "ran"
 
 
 def search(
@@ -651,35 +730,57 @@ def search(
 ) -> dict:
     q = parse_query(query)
     limit = max(1, min(int(limit), 100))
-    if not allowed:
-        return {"query": q.raw, "mode": q.mode, "results": []}
+    coverage = empty_coverage(limit)
+    stages = coverage["limits"]
+    if not query.strip():
+        return {
+            "query": q.raw, "mode": q.mode, "results": [],
+            **({"inferred": "text"} if allowed else {}),
+            "coverage": coverage,
+        }
 
     code_scope = allowed if code_allowed is None else (allowed & code_allowed)
     hits: list[SearchHit] = []
+    candidate_limit = stages["lexical_candidates"]["limit"]
     with database.connection() as connection:
-        hits.extend(_repo_hits(connection, q, allowed, limit))
-        if q.file_candidate and code_scope:
-            hits.extend(_file_hits(connection, q, code_scope, limit))
-        if q.symbol_candidate and q.symbol_role != "reference" and code_scope:
-            hits.extend(_symbol_hits(connection, q, code_scope, limit))
-        rows = (
-            _fts_rows(connection, q, code_scope, max(limit, 40))
-            if q.text and q.mode != "file" and code_scope
-            else []
-        )
+        if q.text and not (q.repo or q.path or q.lang) and q.mode in {"auto", "text"}:
+            cap = stages["repository_hits"]["limit"]
+            repo_hits = _repo_hits(connection, q, allowed, cap + 1)
+            stages["repository_hits"]["state"] = _limit_state(len(repo_hits), cap)
+            hits.extend(repo_hits[:cap])
+        if q.file_candidate and len(q.text or q.path or "") >= 3:
+            file_hits = _file_hits(connection, q, code_scope, limit + 1)
+            stages["file_hits"]["state"] = _limit_state(len(file_hits), limit)
+            hits.extend(file_hits[:limit])
+        if q.symbol_candidate and q.symbol_role != "reference":
+            symbol_hits = _symbol_hits(connection, q, code_scope, limit + 1)
+            stages["symbol_hits"]["state"] = _limit_state(len(symbol_hits), limit)
+            hits.extend(symbol_hits[:limit])
+        rows = []
+        terms = _candidate_terms(q) if q.text and q.mode != "file" else []
+        if terms:
+            rows = _fts_rows(connection, q, code_scope, candidate_limit + 1, terms)
+            stages["lexical_candidates"]["state"] = _limit_state(len(rows), candidate_limit)
+            rows = rows[:candidate_limit]
         if q.symbol_role == "reference":
             definitions = _definition_keys(connection, q, rows)
-            hits.extend(_reference_hits(rows, q, definitions, limit))
+            hits.extend(_reference_hits(rows, q, definitions, limit + 1))
         else:
-            hits.extend(_fts_hits(rows[:limit], q))
+            hits.extend(_fts_hits(rows, q, limit + 1))
         if q.ast_candidate:
-            ast_rows = rows or (
-                _ast_scope_rows(connection, q, code_scope, max(limit, 40))
-                if code_scope
-                else []
-            )
+            ast_rows = rows
+            if not ast_rows:
+                ast_rows = _ast_scope_rows(connection, q, code_scope, candidate_limit + 1)
+                stages["lexical_candidates"]["state"] = _limit_state(len(ast_rows), candidate_limit)
+                ast_rows = ast_rows[:candidate_limit]
             hits.extend(_signature_hits(ast_rows, q))
-            hits.extend(_ast_hits(ast_rows, q, limit, ast_grep))
+            ast_hits, status, files_state = _ast_hits(
+                ast_rows, q, limit + 1, ast_grep,
+                stages["lexical_candidates"]["state"] == "complete",
+            )
+            coverage["ast"]["status"] = status
+            stages["ast_files"]["state"] = files_state
+            hits.extend(ast_hits)
 
     seen: set[tuple] = set()
     merged: list[dict] = []
@@ -689,8 +790,15 @@ def search(
             continue
         seen.add(key)
         merged.append(hit.to_dict())
-        if len(merged) >= limit:
+        if len(merged) > limit:
             break
+    stages["results"]["state"] = (
+        "unknown" if (
+            stages["lexical_candidates"]["state"] == "truncated"
+            or stages["ast_files"]["state"] in {"truncated", "unknown"}
+        )
+        else _limit_state(len(merged), limit)
+    )
 
     inferred = (
         "ast"
@@ -704,6 +812,7 @@ def search(
     return {
         "query": q.raw,
         "mode": q.mode,
-        "inferred": inferred,
-        "results": merged,
+        **({"inferred": inferred} if allowed else {}),
+        "results": merged[:limit],
+        "coverage": coverage,
     }

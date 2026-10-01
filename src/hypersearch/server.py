@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlparse
 from .auth import VisibilityUnavailable
 from .db import indexed_repo_names
 from .query import parse_query
-from .search import scoped_repos, search
+from .search import empty_coverage, scoped_repos, search
 
 
 class SearchServer(ThreadingHTTPServer):
@@ -78,6 +78,10 @@ class SearchHandler(BaseHTTPRequestHandler):
             return self._json(401, {"error": "authentication_required"})
         params = parse_qs(url.query)
         query = (params.get("q") or [""])[0].strip()
+        try:
+            limit = int((params.get("limit") or ["30"])[0])
+        except ValueError:
+            limit = 30
         if not query:
             # The empty-query path is used purely as a "am I signed in?"
             # check by the frontend and always returns no rows regardless of
@@ -90,6 +94,7 @@ class SearchHandler(BaseHTTPRequestHandler):
                     "query": "",
                     "mode": "auto",
                     "results": [],
+                    "coverage": empty_coverage(limit),
                     "total_ms": round((time.perf_counter() - wall_started) * 1000, 2),
                 },
             )
@@ -118,10 +123,6 @@ class SearchHandler(BaseHTTPRequestHandler):
                 503,
                 {"error": "code_visibility_unavailable", "message": str(error)},
             )
-        try:
-            limit = int((params.get("limit") or ["30"])[0])
-        except ValueError:
-            limit = 30
         started = time.perf_counter()
         result = search(
             self.server.database,
