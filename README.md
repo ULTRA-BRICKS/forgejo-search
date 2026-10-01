@@ -216,7 +216,7 @@ requests until expiry or eviction. Each cold `404` adds an identity recheck.
 Increase capacity only with measured upstream headroom; never bypass code permission
 checks or lengthen permission TTLs to hide overload.
 
-The source package version is 0.2.0 for the additive operator controls. Deployment
+The source package version is 0.3.0 for additive viewer-visible coverage. Deployment
 still identifies the runtime by its full vendored source revision, not package
 metadata: the infrastructure owner must update both REVISION and VERSION when
 integrating this source. A source pull request does not update the running service.
