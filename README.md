@@ -142,3 +142,7 @@ uv run pytest -q
 The production index reads Forgejo bare repositories directly, stores 32-line
 overlapping FTS chunks and lightweight symbol metadata, and skips repositories
 whose HEAD revision has not changed.
+
+Each indexing pass reads the discovered commit's immutable tree, even if HEAD
+advances during the pass. Search result snippets and commit URLs therefore share
+one revision. A subsequent pass picks up the newer HEAD.

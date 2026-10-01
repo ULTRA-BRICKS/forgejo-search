@@ -490,3 +490,25 @@ def test_ast_refinement_keeps_identical_blobs_at_distinct_paths(tmp_path):
     assert {hit["path"] for hit in hits if hit["mode"] == "ast"} == {
         "src/focus.js", "src/copy.js",
     }
+
+
+def test_index_snapshot_does_not_follow_head_after_discovery(tmp_path):
+    from hypersearch.indexer import discover_repos, index_repo
+
+    root = fixture_repo(tmp_path)
+    snapshot = discover_repos(root)[0]
+    work = tmp_path / "work"
+    (work / "src/focus.js").write_text("export function newerSymbol() {}\n")
+    subprocess.run(["git", "add", "."], cwd=work, check=True)
+    subprocess.run(["git", "commit", "-m", "advance HEAD"], cwd=work, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "--git-dir", str(root / "acme/demo.git"), "fetch", str(work), "main:main"],
+        check=True, capture_output=True,
+    )
+    db = open_database(tmp_path / "search.db")
+    index_repo(db, snapshot)
+    hits = search(db, "def:restoreFocus", {"acme/demo"})["results"]
+    assert [(hit["path"], hit["revision"]) for hit in hits] == [
+        ("src/focus.js", snapshot.revision)
+    ]
+    assert search(db, "def:newerSymbol", {"acme/demo"})["results"] == []

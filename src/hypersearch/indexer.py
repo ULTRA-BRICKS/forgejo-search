@@ -154,7 +154,7 @@ def safe_git_path(path: str) -> bool:
 
 def _tree_entries(repo: Repo) -> list[tuple[str, int, str]]:
     raw = subprocess.check_output(
-        ["git", "--git-dir", str(repo.path), "ls-tree", "-r", "-l", "-z", "HEAD"],
+        ["git", "--git-dir", str(repo.path), "ls-tree", "-r", "-l", "-z", repo.revision],
         timeout=30,
     )
     entries: list[tuple[str, int, str]] = []
