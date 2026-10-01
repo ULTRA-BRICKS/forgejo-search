@@ -28,6 +28,10 @@ Explicit filters can be combined: `repo:`, `owner:`, `path:`, `lang:`,
 The final term is prefix-matched, so search-as-you-type returns useful results
 before a word is complete. File paths use an SQLite trigram index.
 
+Structural token hits link to the first matching source line, not the start of the
+index chunk. AST candidates preserve distinct file paths even when files share the
+same Git blob; identical contents do not collapse separate file results.
+
 ## Permission model
 
 The public UI and API stay same-origin with Forgejo. Every request forwards the

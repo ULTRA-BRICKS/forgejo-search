@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 _FIELDS = {
@@ -141,8 +142,8 @@ def parse_query(raw: str) -> SearchQuery:
     )
 
 
-def code_tokens(value: str) -> list[str]:
-    return [m.group(0) for m in _CODE_TOKEN.finditer(value)]
+def code_tokens(value: str) -> Iterator[str]:
+    return (m.group(0) for m in _CODE_TOKEN.finditer(value))
 
 
 def structural_signature(value: str) -> str:
