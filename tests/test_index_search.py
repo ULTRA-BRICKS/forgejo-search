@@ -449,3 +449,66 @@ def test_scoped_repos_owner_wildcard_matches_like_scope_clause_sql():
     # not -- a literal-text interpretation of '%' would wrongly match
     # neither.
     assert scoped_repos(query, repos) == {"acmeXevil/repo"}
+
+
+def test_structural_match_links_to_source_line_not_chunk_start(tmp_path):
+    root = fixture_repo(tmp_path)
+    db = open_database(tmp_path / "search.db")
+    index_all(db, root)
+    hits = search(
+        db, "trigger.focus()", {"acme/demo"}, ast_grep="missing-ast-grep"
+    )["results"]
+    match = next(hit for hit in hits if hit["kind"] == "structure")
+    assert match["line"] == 2
+    assert match["url"].endswith("/src/focus.js#L2")
+
+
+def test_ast_refinement_keeps_identical_blobs_at_distinct_paths(tmp_path):
+    root = fixture_repo(tmp_path)
+    work = tmp_path / "work"
+    (work / "src" / "copy.js").write_bytes((work / "src" / "focus.js").read_bytes())
+    subprocess.run(["git", "add", "."], cwd=work, check=True)
+    subprocess.run(["git", "commit", "-m", "copy fixture"], cwd=work, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "--git-dir", str(root / "acme/demo.git"), "fetch", str(work), "main:main"],
+        check=True, capture_output=True,
+    )
+    db = open_database(tmp_path / "search.db")
+    index_all(db, root)
+    fake = tmp_path / "ast-grep"
+    fake.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,pathlib,sys\n"
+        "for p in pathlib.Path(sys.argv[-1]).rglob('*.js'):\n"
+        " print(json.dumps({'file':str(p),'range':{'start':{'line':0}}}))\n"
+    )
+    fake.chmod(0o755)
+    hits = search(
+        db, 'ast:"function restoreFocus($A) { $$$BODY }"',
+        {"acme/demo"}, ast_grep=str(fake),
+    )["results"]
+    assert {hit["path"] for hit in hits if hit["mode"] == "ast"} == {
+        "src/focus.js", "src/copy.js",
+    }
+
+
+def test_index_snapshot_does_not_follow_head_after_discovery(tmp_path):
+    from hypersearch.indexer import discover_repos, index_repo
+
+    root = fixture_repo(tmp_path)
+    snapshot = discover_repos(root)[0]
+    work = tmp_path / "work"
+    (work / "src/focus.js").write_text("export function newerSymbol() {}\n")
+    subprocess.run(["git", "add", "."], cwd=work, check=True)
+    subprocess.run(["git", "commit", "-m", "advance HEAD"], cwd=work, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "--git-dir", str(root / "acme/demo.git"), "fetch", str(work), "main:main"],
+        check=True, capture_output=True,
+    )
+    db = open_database(tmp_path / "search.db")
+    index_repo(db, snapshot)
+    hits = search(db, "def:restoreFocus", {"acme/demo"})["results"]
+    assert [(hit["path"], hit["revision"]) for hit in hits] == [
+        ("src/focus.js", snapshot.revision)
+    ]
+    assert search(db, "def:newerSymbol", {"acme/demo"})["results"] == []

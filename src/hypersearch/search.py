@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass
+from itertools import islice
 from pathlib import Path
 from urllib.parse import quote
 
@@ -430,15 +431,27 @@ def _signature_hits(rows: list[sqlite3.Row], q: SearchQuery) -> list[SearchHit]:
         return []
     hits: list[SearchHit] = []
     for row in rows:
-        if signature not in str(row["signature"]):
+        position = str(row["signature"]).find(signature)
+        if position < 0:
             continue
+        lines = str(row["content"]).splitlines()
+        line_offset = 0
+        if len(lines) > 1:
+            token_offset = str(row["signature"])[:position].count(" ")
+            for line_offset, line in enumerate(lines):
+                if line_offset == len(lines) - 1:
+                    break
+                count = sum(1 for token in islice(code_tokens(line), token_offset + 1))
+                if token_offset < count:
+                    break
+                token_offset -= count
         hits.append(
             _hit(
                 row,
                 kind="structure",
                 score=_BASE_SCORE["structure"] - len(hits) * 0.01,
                 mode="structure",
-                line=int(row["line_start"]),
+                line=int(row["line_start"]) + line_offset,
             )
         )
     return hits
@@ -538,7 +551,7 @@ def _ast_hits(
 
     unique: dict[tuple[str, str], sqlite3.Row] = {}
     for row in rows:
-        unique.setdefault((row["repo_path"], row["blob_oid"]), row)
+        unique.setdefault((row["full_name"], row["path"]), row)
         if len(unique) >= 20:
             break
 
