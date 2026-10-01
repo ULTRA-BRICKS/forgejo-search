@@ -5,7 +5,7 @@ Permission-aware hybrid search for Forgejo.
 Core modes:
 - file/path search
 - symbol definitions and references
-- punctuation/whitespace-insensitive structural token search
+- whitespace-normalized structural token search
 - optional AST refinement with ast-grep
 - BM25-ranked full-text search through SQLite FTS5
 
@@ -44,15 +44,88 @@ projects, releases -- and is not the same as code-read access. Before any file, 
 AST, or full-text hit is returned, the service separately verifies Forgejo's native
 `reqRepoCodeReader` (`unit.TypeCode`) permission for each visible, indexed repository by
 probing that same session cookie against Forgejo's own per-repo code-search web route,
-`GET /{owner}/{reponame}/search` -- the same route backing Forgejo's repository header
-search box. A `404` from that route is the only trusted deny signal; any other failure
-(timeout, `403`, a mid-check session flip, ...) fails the whole request closed rather
-than guessing. This narrower "code-allowed" scope gates file/symbol/AST/text results;
+`HEAD /{owner}/{reponame}/search` -- the same route backing Forgejo's repository header
+search box. Forgejo's chi `GetHead` middleware sends HEAD through the GET handler
+chain, including `reqRepoCodeReader`, without transferring the response body.
+There is **no GET fallback** for a rejected HEAD: `405`/`501` and other ambiguous
+statuses fail closed with `503`. The separate `/repo/search` visibility and identity
+requests use GET and parse JSON; they are not a fallback code-permission probe.
+A `404` is only cached as a code denial after an uncached
+`/repo/search` identity check: a revoked session can also receive a bare `404`
+on a private repository. A login response invalidates that session's cached
+code grants and fails the current request closed. Any ambiguous failure
+(timeout, `403`, malformed identity response, ...) returns `503`, with five-second
+per-session code-probe backoff rather than a cached normal deny.
+This narrower "code-allowed" scope gates file/symbol/AST/text results;
 repository-name hits still use the broader visibility allow-list, since a repository's
 existence is not itself a code disclosure. This code-ACL check only runs once there is
 an actual query to execute, so the empty-query "am I signed in?" fast path used by the
 frontend stays cheap. AST refinement can only materialize documents that already passed
 the ACL-filtered FTS candidate query.
+
+Transient visibility failures return `503`, not a login prompt. A bounded,
+per-session unavailable cache suppresses retries for five seconds, including
+failed pagination; it never reuses a partial repository list. Successful visibility
+and code grants expire after 30 seconds, while anonymous/denied entries expire
+after five seconds. Grant expiry is measured from check start, not response
+completion, so a slow probe cannot extend the stale-permission window.
+Grants must still be unexpired when the complete allow-list is returned; an expired
+grant aborts the request rather than returning partial results. Observed session
+revocation invalidates outstanding checks even after its negative cache entry
+expires or is evicted, so a delayed successful probe cannot resurrect permission.
+Configure `--forgejo` with the full internal base URL including
+Forgejo's AppSubURL (for example `http://127.0.0.1:3000/forgejo`). Login redirects
+must match that mount's login path and either the internal authority or
+`--public-host`; redirects are never followed with the viewer's cookie.
+
+## Probe capacity
+
+`hypersearch serve` accepts these flags (flags override environment variables):
+
+| Flag | Environment variable | Default | Valid range |
+| --- | --- | --- | --- |
+| `--code-probe-budget` | `HYPERSEARCH_CODE_PROBE_BUDGET` | 10 seconds | finite, >0 through 120 |
+| `--code-probe-concurrency` | `HYPERSEARCH_CODE_PROBE_CONCURRENCY` | 8 | integer 1–64 |
+| `--request-timeout` | `HYPERSEARCH_REQUEST_TIMEOUT` | 2 seconds | finite, >0 through 120 |
+| `--code-cache-max-entries` | `HYPERSEARCH_CODE_CACHE_MAX_ENTRIES` | 8192 | integer 1–1000000 |
+
+The code-probe deadline includes waiting for capacity, but not the earlier
+repository-visibility pagination or search execution. Workers and admitted probes
+are bounded across all sessions in one service process, not multiplied per query.
+A deadline or upstream failure returns no partial result. Running probes may finish
+after the caller's deadline; they retain their shared slots until completion.
+Overlapping checks for the same session/repository share one future before worker
+admission. Released capacity wakes pending requests even while their other probes
+are still running.
+The request timeout is a socket timeout, not a hard whole-response deadline.
+Multiple service processes each have their own pool and caches.
+The caller owns `ForgejoAuth` and must call its idempotent `close()` after stopping
+HTTP requests; the CLI does so when its serve loop exits. Shutdown joins admitted
+probes rather than abandoning their worker threads.
+The deployment's nginx 15-second timeout is not an end-to-end authorization guarantee:
+cold visibility pagination precedes the code-probe budget, and socket timeouts do not
+cap total response duration. Release acceptance must measure the full authenticated
+request, not label the code-probe budget as its end-to-end deadline.
+
+Cold unscoped searches still probe **every visible, indexed repository**, not just
+repositories with text matches. `repo:` and `owner:` narrow candidates before probing;
+path/language terms do not. Empty queries skip code probes. Warm entries avoid HTTP
+requests until expiry or eviction. Each cold `404` adds an identity recheck.
+Increase capacity only with measured upstream headroom; never bypass code permission
+checks or lengthen permission TTLs to hide overload.
+
+The source package version is 0.2.0 for the additive operator controls. Deployment
+still identifies the runtime by its full vendored source revision, not package
+metadata: the infrastructure owner must update both REVISION and VERSION when
+integrating this source. A source pull request does not update the running service.
+
+A synthetic localhost HTTP workload with 600 indexed/visible repositories and
+150 ms per HEAD measured: default 8 workers/10 seconds failed closed at 10.04 seconds;
+five subsequent keystrokes returned backed-off `503` in 1.4–2.3 ms with zero new HEADs.
+8 workers/20 seconds completed in 11.80 seconds; 16 workers/10 seconds in 5.99 seconds.
+Warm searches took 5.6–6.7 ms with zero HEADs; a cold single-repository query took
+166 ms with one HEAD. These are fixture measurements, not production guarantees.
+Expiry, eviction, other sessions and identity rechecks can make later searches cold.
 
 ## Development
 

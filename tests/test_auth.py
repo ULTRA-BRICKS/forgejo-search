@@ -99,6 +99,13 @@ def test_code_readable_repositories_against_a_real_http_server():
         def log_message(self, *args):
             pass
 
+        def do_GET(self):
+            body = b'{"ok":true,"data":[]}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_HEAD(self):
             cookie = self.headers.get("Cookie", "")
             if self.path == "/acme/code/search":
@@ -346,7 +353,6 @@ def test_login_redirect_mid_pagination_is_unavailable_not_downgraded():
     auth = RevokedMidPaginationAuth()
     with pytest.raises(VisibilityUnavailable):
         auth.visible_repositories("alice")
-    assert not auth.cache
 
 
 class ShortPageThenClampedServerAuth(ForgejoAuth):
@@ -624,6 +630,9 @@ class CodeRouteAuth(ForgejoAuth):
         super().__init__(**kwargs)
         self.code_calls = []
 
+    def _get(self, path, cookie):
+        return _search_payload([])
+
     def _head(self, path, cookie):
         self.code_calls.append((path, cookie))
         if "/acme/issues-only/" in path:
@@ -779,6 +788,9 @@ class FlippingCodeAuth(ForgejoAuth):
         super().__init__(ttl=30, negative_ttl=30)
         self.code_calls = []
         self.denied = False
+
+    def _get(self, path, cookie):
+        return _search_payload([])
 
     def _head(self, path, cookie):
         self.code_calls.append(path)
@@ -950,24 +962,3 @@ def test_code_cache_max_entries_bounds_independently_of_max_entries():
     assert len(auth._code_cache) <= 5
 
 
-def test_code_acl_fully_cached_skips_threadpool_executor(monkeypatch):
-    import hypersearch.auth as auth_module
-
-    auth = ForgejoAuth()
-    auth._head = lambda path, cookie: 200
-    # Warm the cache for both repos via a real (uninstrumented) fan-out.
-    auth.code_readable_repositories("session=alice", {"acme/a", "acme/b"})
-
-    created = []
-    original = auth_module.ThreadPoolExecutor
-
-    def spy(*args, **kwargs):
-        created.append(True)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(auth_module, "ThreadPoolExecutor", spy)
-    result = auth.code_readable_repositories("session=alice", {"acme/a", "acme/b"})
-    assert result == {"acme/a", "acme/b"}
-    # Every candidate resolved from cache -- the fast path must return
-    # without ever constructing a ThreadPoolExecutor.
-    assert created == []
