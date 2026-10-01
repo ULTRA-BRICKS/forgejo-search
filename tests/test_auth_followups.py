@@ -243,6 +243,15 @@ def test_duplicate_searches_leave_capacity_for_another_session(monkeypatch):
     entered = threading.Event()
     release = threading.Event()
     calls = []
+    joined = threading.Event()
+    wait = auth._capacity.wait
+
+    def observe_wait(timeout=None):
+        if threading.current_thread().name.startswith("duplicate"):
+            joined.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(auth._capacity, "wait", observe_wait)
 
     def probe(path, cookie):
         calls.append(cookie)
@@ -252,11 +261,14 @@ def test_duplicate_searches_leave_capacity_for_another_session(monkeypatch):
         return 200
 
     monkeypatch.setattr(auth, "_head", probe)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as callers:
+    with (
+        concurrent.futures.ThreadPoolExecutor(max_workers=2) as callers,
+        concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="duplicate") as duplicates,
+    ):
         first = callers.submit(auth.code_readable_repositories, "session=slow", {"acme/code"})
         assert entered.wait(1)
-        duplicate = callers.submit(auth.code_readable_repositories, "session=slow", {"acme/code"})
-        threading.Event().wait(0.05)
+        duplicate = duplicates.submit(auth.code_readable_repositories, "session=slow", {"acme/code"})
+        assert joined.wait(1)
         other = callers.submit(auth.code_readable_repositories, "session=fast", {"acme/code"})
         try:
             assert other.result(timeout=0.5) == {"acme/code"}
@@ -445,26 +457,25 @@ def test_close_releases_retained_worker_pool(monkeypatch):
 
 
 def test_delayed_failed_future_does_not_restart_expired_backoff(monkeypatch):
-    failed = [False]
-    clock_reads = [0]
-    auth = ForgejoAuth()
+    import concurrent.futures
 
-    def clock():
-        if failed[0]:
-            clock_reads[0] += 1
-            return 100.0 if clock_reads[0] == 1 else 106.0
-        return 100.0
+    now = [100.0]
+    monkeypatch.setattr("hypersearch.auth.time.monotonic", lambda: now[0])
+    auth = ForgejoAuth()
+    publish = concurrent.futures.Future.set_exception
+
+    def delayed_publish(future, error):
+        now[0] = 106.0
+        publish(future, error)
 
     def probe(path, cookie):
-        if not failed[0]:
-            failed[0] = True
-            raise TimeoutError()
-        return 200
+        raise TimeoutError()
 
-    monkeypatch.setattr("hypersearch.auth.time.monotonic", clock)
+    monkeypatch.setattr(concurrent.futures.Future, "set_exception", delayed_publish)
     monkeypatch.setattr(auth, "_head", probe)
     with pytest.raises(VisibilityUnavailable):
         auth.code_readable_repositories("session=test", {"acme/code"})
+    monkeypatch.setattr(auth, "_head", lambda path, cookie: 200)
     assert auth.code_readable_repositories("session=test", {"acme/code"}) == {"acme/code"}
 
 
@@ -508,3 +519,52 @@ def test_waiting_searches_observe_new_code_backoff(monkeypatch):
             with pytest.raises(VisibilityUnavailable):
                 future.result(timeout=1)
     assert calls == ["/acme/a/search"]
+
+
+def test_revocation_survives_delayed_future_publication(monkeypatch):
+    import concurrent.futures
+    import threading
+
+    now = [100.0]
+    monkeypatch.setattr("hypersearch.auth.time.monotonic", lambda: now[0])
+    auth = ForgejoAuth(code_probe_concurrency=2)
+    publishing = threading.Event()
+    joined = threading.Event()
+    release = threading.Event()
+    publish = concurrent.futures.Future.set_result
+    wait = auth._capacity.wait
+
+    def delayed_publish(future, result):
+        if threading.current_thread().name.startswith("forgejo-code"):
+            publishing.set()
+            if not release.wait(2):
+                future.set_exception(TimeoutError("test did not release future publication"))
+                return
+        publish(future, result)
+
+    def observe_wait(timeout=None):
+        if threading.current_thread().name.startswith("late"):
+            joined.set()
+        return wait(timeout)
+
+    monkeypatch.setattr(concurrent.futures.Future, "set_result", delayed_publish)
+    monkeypatch.setattr(auth._capacity, "wait", observe_wait)
+    monkeypatch.setattr(auth, "_head", lambda path, cookie: 401 if "revoked" in path else 200)
+    with (
+        concurrent.futures.ThreadPoolExecutor(max_workers=1) as first_pool,
+        concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="late") as late_pool,
+    ):
+        first = first_pool.submit(auth.code_readable_repositories, "session=test", {"acme/code"})
+        try:
+            assert publishing.wait(1)
+            with pytest.raises(VisibilityUnavailable):
+                auth.code_readable_repositories("session=test", {"acme/revoked"})
+            with pytest.raises(VisibilityUnavailable):
+                first.result(timeout=1)
+            now[0] = 106
+            late = late_pool.submit(auth.code_readable_repositories, "session=test", {"acme/code"})
+            assert joined.wait(1)
+        finally:
+            release.set()
+        with pytest.raises(VisibilityUnavailable):
+            late.result(timeout=1)

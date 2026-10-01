@@ -171,7 +171,7 @@ class ForgejoAuth:
         self._guard = threading.RLock()
         self._capacity = threading.Condition(self._guard)
         self._inflight: dict[str, threading.Event] = {}
-        self._code_futures: dict[str, Future] = {}
+        self._code_futures: dict[str, tuple[Future, threading.Event]] = {}
         self._active_checks: dict[str, set[threading.Event]] = {}
         # Never allow Forgejo session cookies through ambient HTTP(S)_PROXY, and
         # never follow a redirect that could carry the Cookie off the local origin.
@@ -644,8 +644,10 @@ class ForgejoAuth:
 
         def completed(key: str, future: Future) -> None:
             with self._capacity:
-                if self._code_futures.get(key) is future:
+                record = self._code_futures.get(key)
+                if record is not None and record[0] is future:
                     self._code_futures.pop(key)
+                    self._finish_check(key.partition(":")[0], record[1])
                 self._capacity.notify_all()
 
         def timeout_error() -> VisibilityUnavailable:
@@ -666,8 +668,10 @@ class ForgejoAuth:
                     # Consume failures before admitting more upstream work.
                     for future in list(futures):
                         if future.done():
-                            repo = futures.pop(future)
+                            repo, probe_revoked = futures.pop(future)
                             expires, allowed = future.result()
+                            if probe_revoked.is_set():
+                                raise VisibilityUnavailable("Forgejo session was revoked before probe publication")
                             if allowed:
                                 readable[repo] = expires
                     while pending:
@@ -680,17 +684,25 @@ class ForgejoAuth:
                             if cached[1]:
                                 readable[repo] = cached[0]
                             continue
-                        future = self._code_futures.get(key)
-                        if future is None:
+                        record = self._code_futures.get(key)
+                        if record is None:
                             if len(self._code_futures) >= self.code_probe_concurrency:
                                 break
-                            future = executor.submit(self._code_readable, cookie, repo, revoked)
-                            self._code_futures[key] = future
+                            session_key = key.partition(":")[0]
+                            probe_revoked = self._start_check(session_key)
+                            try:
+                                future = executor.submit(self._code_readable, cookie, repo, probe_revoked)
+                            except BaseException:
+                                self._finish_check(session_key, probe_revoked)
+                                raise
+                            record = (future, probe_revoked)
+                            self._code_futures[key] = record
                             future.add_done_callback(
                                 lambda result, key=key: completed(key, result)
                             )
+                        future, probe_revoked = record
                         pending.pop()
-                        futures[future] = repo
+                        futures[future] = (repo, probe_revoked)
                     if (pending or futures) and not any(f.done() for f in futures):
                         self._capacity.wait(timeout=budget_left)
         except VisibilityUnavailable as error:
