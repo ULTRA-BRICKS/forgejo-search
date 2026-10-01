@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "HyperSearch coverage version 1",
+  "description": "The additive coverage member of a successful search response, not the whole response envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "scope", "completeness", "semantics", "ast", "limits"],
+  "properties": {
+    "version": {"const": 1},
+    "scope": {"const": "authorized_indexed_default_branch"},
+    "completeness": {"const": "bounded"},
+    "semantics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["definitions", "references"],
+      "properties": {
+        "definitions": {"const": "pattern_based"},
+        "references": {"const": "lexical"}
+      }
+    },
+    "ast": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"enum": ["not_requested", "no_candidates", "ran", "unavailable", "timeout", "failed"]}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_hits", "file_hits", "symbol_hits", "lexical_candidates", "ast_files", "results"],
+      "properties": {
+        "repository_hits": {"allOf": [{"$ref": "#/$defs/stage"}, {"properties": {"limit": {"maximum": 12}}}]},
+        "file_hits": {"$ref": "#/$defs/stage"},
+        "symbol_hits": {"$ref": "#/$defs/stage"},
+        "lexical_candidates": {"allOf": [{"$ref": "#/$defs/stage"}, {"properties": {"limit": {"minimum": 40}}}]},
+        "ast_files": {"allOf": [{"$ref": "#/$defs/stage"}, {"properties": {"limit": {"const": 20}}}]},
+        "results": {"$ref": "#/$defs/stage"}
+      }
+    }
+  },
+  "$defs": {
+    "stage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "state"],
+      "properties": {
+        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+        "state": {"enum": ["not_applicable", "complete", "truncated", "unknown"]}
+      }
+    }
+  }
+}

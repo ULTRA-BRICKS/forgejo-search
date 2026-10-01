@@ -52,14 +52,83 @@ Search is hybrid retrieval, not a language-server or exhaustive code analysis:
   refinement uses at most 20 distinct candidate files and a two-second process
   timeout; a no-literal pattern uses a bounded scoped chunk fallback. Missing or
   failed ast-grep leaves lexical/token results, not proof that no AST matches exist.
-  Truncation/engine availability is not yet exposed in the response; tracked in
-  [the search coverage follow-up](https://git.hyperide.ai/ultrabricks/forgejo-search/issues/13).
+  The additive `coverage` response below exposes engine outcomes and stage limits.
 - `repo:` uses an exact full name. `owner:` and `path:` retain SQL LIKE wildcard
   behavior (`%` and `_`); `lang:` uses the indexed language name.
 - Only the default branch HEAD is indexed, when the operator runs `hypersearch index`.
   This service does not schedule indexing or promise a freshness interval. Files
   above 512 KiB, binary data, lockfiles and generated/vendor directories are skipped.
   Results use immutable commit links; they are not live working-tree results.
+
+### Successful response contract: `coverage.version = 1`
+
+HTTP and offline `hypersearch query` responses include the same `coverage` object.
+The [JSON Schema](docs/search-coverage.schema.json) defines that member, not the
+whole response. Existing query/mode/inferred fields, result objects, immutable
+URLs and HTTP timings retain their meanings. `elapsed_ms` measures search
+execution; `total_ms` includes preceding authorization. An authenticated empty
+HTTP query retains its smaller envelope (`query`, `mode`, `results`, `total_ms`)
+and adds stable coverage with every stage `not_applicable` and AST `not_requested`,
+without code-permission probes. Fail-closed 401/503 responses contain neither
+partial results nor coverage.
+
+Coverage always declares `scope: authorized_indexed_default_branch`,
+`completeness: bounded`, and
+`semantics: {definitions: pattern_based, references: lexical}`. No state claims
+exhaustive semantic search, index freshness or coverage of skipped files.
+
+| Field under `coverage.limits` | Actual cap | Scope and applicability |
+| --- | --- | --- |
+| `repository_hits` | `min(limit, 12)` | Indexed repository names visible to the caller; eligible plain/text queries only |
+| `file_hits` | `limit` | Code-readable file paths; file candidates of at least three characters |
+| `symbol_hits` | `limit` | Code-readable symbol rows; definition/symbol candidates, not reference-only queries |
+| `lexical_candidates` | `max(limit, 40)` | Code-readable chunks selected by FTS, or the scoped chunk fallback when AST has no lexical candidates |
+| `ast_files` | 20 | Distinct code-readable repository/path pairs, never distinct blobs |
+| `results` | `limit` | Final ranked merge, deduplicated by repository/path/line/kind before limiting |
+
+`limit` is clamped to 1–100 (HTTP default/invalid integer: 30). Inactive stages
+still report their cap. A single extra authorized row distinguishes `truncated`
+from an exactly-full `complete` stage; sentinels never become permission probes or
+cause an extra AST file to be materialized. `complete` applies only to the named
+retrieval/merge stage, not to the entire installation or the skipped stages.
+`not_applicable` means that mode did not request the stage. `unknown` means
+exhaustion cannot be established safely: capped upstream chunks make downstream
+AST-file and result coverage unknown. Truncated or unknown AST-file coverage also
+makes final-result coverage unknown; skipped blob materialization makes AST-file
+coverage unknown. This conservative propagation prevents global FTS ranking
+statistics from turning changes in inaccessible code into changing coverage
+metadata. Final merge `complete` does not override an upstream `truncated` stage
+or an unavailable engine.
+
+`coverage.ast.status` is one of:
+
+- `not_requested`: no AST refinement for this query.
+- `no_candidates`: no authorized candidate chunks, without testing engine availability.
+- `ran`: successful engine invocation, with zero or more structural matches.
+- `unavailable`: the executable could not be found or launched.
+- `timeout`: AST execution/output processing exhausted the shared two-second budget.
+- `failed`: nonzero exit, malformed consumed output, or no selected blobs could be materialized.
+
+`ran` is not a pattern-validity or supported-language guarantee: ast-grep can
+successfully emit no matches for an unsupported pattern. The exercised ast-grep
+0.39.4 `run --json=stream` exits zero on both matches and no matches; nonzero
+execution is not interpreted as a successful empty search. Output decoding stops
+after `limit + 1` unique AST hits; surplus records cannot turn a proven bounded
+success into a parse timeout. Malformed consumed records discard the AST batch,
+while lexical/token fallback remains available. Raw diagnostics, executable
+paths, repository totals, denied-code counts and index identifiers are not part
+of coverage.
+Duplicate AST records can require decoding until a unique sentinel, exhaustion,
+or the shared timeout. There is no separate raw-record/byte cap: subprocess output
+is still captured in memory. Coverage does not claim a streaming memory bound.
+
+Consumers should feature-detect version 1, display bounded scope and lexical/
+pattern-based semantics, distinguish empty results from AST unavailability, and
+surface `truncated`/`unknown` stage warnings independently of result count.
+Older/missing versions must not be rendered as complete. Repository-name scope
+is broader than code scope; do not infer code access from a name hit. This backend
+contract does not implement the header UI; the consumer and deployed viewer proof
+remain owned by [task 13](https://git.hyperide.ai/ultrabricks/forgejo-search/issues/13).
 
 ## Permission model
 
@@ -147,7 +216,7 @@ requests until expiry or eviction. Each cold `404` adds an identity recheck.
 Increase capacity only with measured upstream headroom; never bypass code permission
 checks or lengthen permission TTLs to hide overload.
 
-The source package version is 0.2.0 for the additive operator controls. Deployment
+The source package version is 0.3.0 for additive viewer-visible coverage. Deployment
 still identifies the runtime by its full vendored source revision, not package
 metadata: the infrastructure owner must update both REVISION and VERSION when
 integrating this source. A source pull request does not update the running service.

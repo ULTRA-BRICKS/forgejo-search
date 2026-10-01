@@ -81,6 +81,7 @@ def test_search_requires_existing_forgejo_session(server):
     status, payload = get_json(server, "/api/hypersearch?q=secret")
     assert status == 401
     assert payload["error"] == "authentication_required"
+    assert "coverage" not in payload
 
 
 def test_visibility_failure_is_explicit_503(server):
@@ -91,6 +92,7 @@ def test_visibility_failure_is_explicit_503(server):
     )
     assert status == 503
     assert payload["error"] == "visibility_unavailable"
+    assert "coverage" not in payload
 
 
 def test_empty_query_stays_authenticated_but_returns_no_rows(server):
@@ -128,6 +130,7 @@ def test_code_visibility_failure_is_explicit_503(server):
     )
     assert status == 503
     assert payload["error"] == "code_visibility_unavailable"
+    assert "coverage" not in payload
 
 
 class CountingCodeAuth(FakeAuth):
@@ -147,6 +150,12 @@ def test_empty_query_never_triggers_code_acl_check(tmp_path):
     assert status == 200
     assert payload["results"] == []
     assert auth.code_calls == 0
+    assert payload["coverage"]["version"] == 1
+    assert payload["coverage"]["ast"] == {"status": "not_requested"}
+    assert all(
+        stage["state"] == "not_applicable"
+        for stage in payload["coverage"]["limits"].values()
+    )
 
 
 def test_anonymous_request_never_triggers_code_acl_check(tmp_path):

@@ -18,7 +18,7 @@ from hypersearch.indexer import index_all
 
 
 @contextmanager
-def native_contract_server(tmp_path, monkeypatch):
+def native_contract_server(tmp_path, monkeypatch, ast_grep="missing-ast-grep"):
     state = {"signed_in": True, "code": {"open"}, "revoke_on_head": False, "head_status": None}
     now = [100.0]
     monkeypatch.setattr("hypersearch.auth.time.monotonic", lambda: now[0])
@@ -58,7 +58,7 @@ def native_contract_server(tmp_path, monkeypatch):
     db = open_database(tmp_path / "search.db")
     index_all(db, _two_repo_root(tmp_path))
     try:
-        with running_server(db, auth) as base:
+        with running_server(db, auth, ast_grep=ast_grep) as base:
             def query(text, cookie="fixture=local-native-contract"):
                 return get_json(base, "/api/hypersearch?" + urlencode({"q": text}), cookie)
             yield query, state, now
@@ -124,3 +124,30 @@ def test_rejected_head_fails_closed_without_get_fallback(tmp_path, monkeypatch):
         assert status == 503
         assert payload["error"] == "code_visibility_unavailable"
         assert "results" not in payload
+
+
+def test_enabled_ast_only_materializes_code_authorized_contents(tmp_path, monkeypatch, controlled_ast):
+    executable, observed = controlled_ast()
+    with native_contract_server(tmp_path, monkeypatch, executable) as (query, state, now):
+        status, allowed = query("ast:publicHelper($A)")
+        assert status == 200
+        assert allowed["coverage"]["ast"] == {"status": "ran"}
+        ast_hits = [hit for hit in allowed["results"] if hit["mode"] == "ast"]
+        assert [(hit["repo"], hit["path"]) for hit in ast_hits] == [
+            ("acme/open", "src/public.js"),
+        ]
+        assert json.loads(observed.read_text()) == [
+            "export function publicHelper() {\n  return 1;\n}\n",
+        ]
+        status, denied = query("ast:hiddenHelper($A)")
+        assert status == 200
+        assert all(hit["repo"] == "acme/open" for hit in denied["results"])
+        assert "hiddenHelper" not in observed.read_text()
+        state["code"] = set()
+        now[0] = 131
+        previous = observed.read_text()
+        status, denied = query("ast:publicHelper($A)")
+        assert status == 200
+        assert denied["results"] == []
+        assert denied["coverage"]["ast"] == {"status": "no_candidates"}
+        assert observed.read_text() == previous

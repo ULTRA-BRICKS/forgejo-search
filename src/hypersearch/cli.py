@@ -67,7 +67,10 @@ def parser():
         default=os.getenv("HYPERSEARCH_CODE_CACHE_MAX_ENTRIES", "8192"),
         help="code permission cache bound, 1..1000000 (env HYPERSEARCH_CODE_CACHE_MAX_ENTRIES; default 8192)",
     )
-    q = sub.add_parser("query")
+    q = sub.add_parser(
+        "query",
+        description="Search the authorized local index; emit JSON results and bounded coverage version 1.",
+    )
     q.add_argument("query")
     q.add_argument("--allow", action="append", default=[])
     q.add_argument("--limit", type=int, default=30)
