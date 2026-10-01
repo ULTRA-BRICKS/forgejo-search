@@ -32,6 +32,35 @@ Structural token hits link to the first matching source line, not the start of t
 index chunk. AST candidates preserve distinct file paths even when files share the
 same Git blob; identical contents do not collapse separate file results.
 
+## Coverage and limits
+
+Search is hybrid retrieval, not a language-server or exhaustive code analysis:
+
+- Repository-name hits use indexed, visible repositories (at most 12 per query).
+  There is no separate `type:repo` mode; use a plain repository name.
+- File mode uses path trigrams and deliberately returns no matches below three
+  characters. Definitions use selected regular-expression patterns for JavaScript,
+  TypeScript, Python, Rust and Go, not every language recognized for text indexing.
+- References match identifier boundaries and exclude indexed definition lines.
+  They are lexical occurrences, not symbol-resolution, call-graph or rename results;
+  comments, strings and imports can match.
+- Structural token matching normalizes whitespace but retains punctuation tokens.
+  AST refinement requires the configured `ast-grep` executable and a valid pattern.
+  Both are hybrid modes: lower-ranked lexical results can remain alongside
+  `mode: ast` or `mode: structure` hits. An AST query is not an AST-only result contract.
+- Lexical candidate selection uses at most `max(limit, 40)` ranked chunks. AST
+  refinement uses at most 20 distinct candidate files and a two-second process
+  timeout; a no-literal pattern uses a bounded scoped chunk fallback. Missing or
+  failed ast-grep leaves lexical/token results, not proof that no AST matches exist.
+  Truncation/engine availability is not yet exposed in the response; tracked in
+  [the search coverage follow-up](https://git.hyperide.ai/ultrabricks/forgejo-search/issues/13).
+- `repo:` uses an exact full name. `owner:` and `path:` retain SQL LIKE wildcard
+  behavior (`%` and `_`); `lang:` uses the indexed language name.
+- Only the default branch HEAD is indexed, when the operator runs `hypersearch index`.
+  This service does not schedule indexing or promise a freshness interval. Files
+  above 512 KiB, binary data, lockfiles and generated/vendor directories are skipped.
+  Results use immutable commit links; they are not live working-tree results.
+
 ## Permission model
 
 The public UI and API stay same-origin with Forgejo. Every request forwards the
