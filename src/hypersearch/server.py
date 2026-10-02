@@ -37,7 +37,12 @@ from . import __version__
 from . import deadline as scope
 from .auth import VisibilityUnavailable
 from .db import indexed_repo_names
-from .deadline import DEADLINE_REASON, DeadlineExceeded, RequestCancelled, RequestContext
+from .deadline import (
+    DEADLINE_REASON,
+    DeadlineExceeded,
+    RequestCancelled,
+    RequestContext,
+)
 from .query import parse_query
 from .search import empty_coverage, scoped_repos, search
 
@@ -316,7 +321,7 @@ class SearchServer(ThreadingHTTPServer):
                 return _DEADLINE
             except RequestCancelled:
                 return _UNAVAILABLE
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - last resort: answer, never crash a worker
                 # Never forward raw exceptions to the client: they can carry private
                 # metadata. Record the type and place only, never the message.
                 frame = traceback.extract_tb(error.__traceback__)[-1]

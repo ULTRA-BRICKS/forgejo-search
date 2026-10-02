@@ -91,9 +91,8 @@ def test_module_helpers_are_noops_without_a_bound_context():
     assert deadline.clamp(1.5) == 1.5
     context = RequestContext(5)
     context.cancel("x")
-    with deadline.bound(context):
-        with pytest.raises(RequestCancelled):
-            deadline.checkpoint()
+    with deadline.bound(context), pytest.raises(RequestCancelled):
+        deadline.checkpoint()
 
 
 def test_cancel_from_another_thread_is_visible_immediately():

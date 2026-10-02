@@ -112,7 +112,7 @@ def test_missing_total_header_falls_back_to_sequential_pagination(make):
 
 def test_understated_total_still_confirms_completeness_with_an_empty_page(make):
     # The advertised count only schedules requests; completeness is "walk to an empty page".
-    fake, auth = make({"visible": names(230), "total_override": 40})
+    _fake, auth = make({"visible": names(230), "total_override": 40})
     assert auth.visible_repositories(COOKIE)[1] == set(names(230))
 
 
@@ -124,7 +124,7 @@ def test_overstated_total_stays_inside_the_pagination_safety_bound(make):
 
 
 def test_more_than_the_safety_bound_still_fails_closed_in_parallel(make):
-    fake, auth = make({"visible": names(1100), "page_delay": 0.01})
+    _fake, auth = make({"visible": names(1100), "page_delay": 0.01})
     with pytest.raises(VisibilityUnavailable):
         auth.visible_repositories(COOKIE)
     assert not auth.cache
@@ -143,7 +143,7 @@ def test_session_revoked_while_parallel_pages_are_in_flight_is_unavailable_and_u
 
 
 def test_grant_lifetime_is_measured_from_walk_start_in_parallel(make):
-    fake, auth = make({"visible": names(750), "page_delay": 0.2}, ttl=0.3)
+    _fake, auth = make({"visible": names(750), "page_delay": 0.2}, ttl=0.3)
     with pytest.raises(VisibilityUnavailable):
         auth.visible_repositories(COOKIE)
     assert not auth.cache
@@ -266,7 +266,7 @@ def test_repo_scope_prefers_a_fresh_full_allowlist_without_network(make):
 @pytest.mark.parametrize("repo", ["acme/caf\u00e9", "open", "acme/..", "a/b/c", "acme/op en"])
 def test_unsafe_repo_scope_values_fall_back_to_the_complete_listing(make, repo):
     fake, auth = make({"visible": [*names(60), "acme/open"]})
-    assert auth.visible_repositories(COOKIE, repo=repo) == (True, set([*names(60), "acme/open"]))
+    assert auth.visible_repositories(COOKIE, repo=repo) == (True, {*names(60), "acme/open"})
     assert fake.count("scoped") == 0
     assert fake.count("list") >= 1
 
@@ -287,10 +287,9 @@ def test_scoped_allowlist_does_not_survive_observed_revocation(make):
 def test_expired_context_stops_listing_without_poisoning_the_session(make):
     from hypersearch.deadline import DeadlineExceeded, RequestContext, bound
 
-    fake, auth = make({"visible": names(750), "page_delay": 0.4})
-    with bound(RequestContext(0.15)):
-        with pytest.raises(DeadlineExceeded):
-            auth.visible_repositories(COOKIE)
+    _fake, auth = make({"visible": names(750), "page_delay": 0.4})
+    with bound(RequestContext(0.15)), pytest.raises(DeadlineExceeded):
+        auth.visible_repositories(COOKIE)
     # A deadline is the caller's problem, not an upstream outage: no 5 second backoff.
     assert auth.visible_repositories(COOKIE)[1] == set(names(750))
 
@@ -298,7 +297,7 @@ def test_expired_context_stops_listing_without_poisoning_the_session(make):
 def test_cancelled_leader_does_not_fail_a_follower_that_still_needs_the_listing(make):
     from hypersearch.deadline import RequestCancelled, RequestContext, bound
 
-    fake, auth = make({"visible": names(150), "page_delay": 0.3}, visibility_concurrency=1)
+    _fake, auth = make({"visible": names(150), "page_delay": 0.3}, visibility_concurrency=1)
     leader_context = RequestContext(30)
     results: dict = {}
 
@@ -333,9 +332,8 @@ def test_cancellation_stops_scheduling_further_code_probes(make):
     )
     context = RequestContext(30)
     threading.Timer(0.25, lambda: context.cancel("client_disconnected")).start()
-    with bound(context):
-        with pytest.raises(RequestCancelled):
-            auth.code_readable_repositories(COOKIE, set(names(60)))
+    with bound(context), pytest.raises(RequestCancelled):
+        auth.code_readable_repositories(COOKIE, set(names(60)))
     time.sleep(0.5)
     assert fake.count("head") <= 8
 
@@ -365,7 +363,7 @@ def test_a_shared_probe_survives_one_requester_cancelling(make):
 
 
 def test_close_joins_listing_workers(make):
-    fake, auth = make({"visible": names(200)})
+    _fake, auth = make({"visible": names(200)})
     auth.visible_repositories(COOKIE)
     workers = [t for t in threading.enumerate() if t.name.startswith("forgejo-page")]
     assert workers
@@ -391,7 +389,7 @@ def test_identity_requests_keep_the_app_sub_url_mount(make):
 def test_overstated_total_cannot_hide_a_logout_seen_on_a_later_page(make):
     # 120 repositories end at page 4, yet the advertised count makes pages up to 21 be
     # fetched; a login redirect on a page past the empty one is still an observed logout.
-    fake, auth = make({"visible": names(120), "total_override": 10_000_000, "logout_from_page": 10})
+    _fake, auth = make({"visible": names(120), "total_override": 10_000_000, "logout_from_page": 10})
     assert auth.code_readable_repositories(COOKIE, {"acme/r0001"}) == {"acme/r0001"}
     assert auth._code_cache
     with pytest.raises(VisibilityUnavailable):
@@ -424,7 +422,7 @@ def test_visibility_concurrency_bounds_sequential_fallback_pages_too(make):
 
 
 def test_denial_confirmation_counts_against_the_code_probe_budget(make):
-    fake, auth = make(
+    _fake, auth = make(
         {"visible": names(1), "readable": [], "count_delay": 1.0}, code_probe_budget=0.3
     )
     started = time.perf_counter()
@@ -481,11 +479,10 @@ def test_a_logout_seen_by_a_prefetched_page_revokes_even_if_a_sibling_page_error
 def test_denial_confirmation_respects_the_parents_shorter_deadline(make):
     from hypersearch.deadline import DeadlineExceeded, RequestContext, bound
 
-    fake, auth = make({"visible": names(1), "readable": [], "count_delay": 1.5})
+    _fake, auth = make({"visible": names(1), "readable": [], "count_delay": 1.5})
     started = time.perf_counter()
-    with bound(RequestContext(0.3)):
-        with pytest.raises(DeadlineExceeded):
-            auth.code_readable_repositories(COOKIE, set(names(1)))
+    with bound(RequestContext(0.3)), pytest.raises(DeadlineExceeded):
+        auth.code_readable_repositories(COOKIE, set(names(1)))
     assert time.perf_counter() - started < 1.0
 
 
@@ -545,9 +542,8 @@ def test_a_bound_request_deadline_also_bounds_the_upstream_socket_lifetime():
     auth = ForgejoAuth(f"http://127.0.0.1:{upstream.server_address[1]}", request_timeout=2.0)
     try:
         started = time.perf_counter()
-        with bound(RequestContext(0.3)):
-            with pytest.raises(DeadlineExceeded):
-                auth.visible_repositories(COOKIE)
+        with bound(RequestContext(0.3)), pytest.raises(DeadlineExceeded):
+            auth.visible_repositories(COOKIE)
         assert time.perf_counter() - started < 0.8  # not the 2 s socket timeout, nor 1.2 s of body
     finally:
         auth.close()

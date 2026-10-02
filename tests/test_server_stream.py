@@ -403,13 +403,15 @@ def test_a_trickling_client_cannot_keep_a_rejected_connection_open(database):
 
 def test_unexpected_failures_are_logged_by_type_and_place_never_by_message(database, caplog):
     failure = RuntimeError("cookie=SECRET-VALUE repo=acme/private")
-    with caplog.at_level(logging.ERROR, logger="hypersearch.server"):
-        with serving(database, ScriptedAuth(failure=failure)) as (_, base):
-            stream = Stream(base, PATH, accept="application/json")
-            try:
-                body = json.loads(stream.body())
-            finally:
-                stream.close()
+    with (
+        caplog.at_level(logging.ERROR, logger="hypersearch.server"),
+        serving(database, ScriptedAuth(failure=failure)) as (_, base),
+    ):
+        stream = Stream(base, PATH, accept="application/json")
+        try:
+            body = json.loads(stream.body())
+        finally:
+            stream.close()
     assert stream.status == 503 and body == {"error": "search_unavailable"}
     assert "RuntimeError" in caplog.text
     assert "SECRET-VALUE" not in caplog.text and "acme/private" not in caplog.text
@@ -643,9 +645,8 @@ def test_a_client_that_stops_reading_is_cut_off_within_the_write_budget(tmp_path
 
 
 def test_writer_marks_a_stuck_socket_as_a_client_disconnect():
-    from hypersearch.server import NdjsonStream, StreamBroken
-
     from hypersearch.deadline import RequestContext
+    from hypersearch.server import NdjsonStream, StreamBroken
 
     context = RequestContext(10)
 

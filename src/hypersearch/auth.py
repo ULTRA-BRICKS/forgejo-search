@@ -196,7 +196,7 @@ class _Denial(NamedTuple):
 class _Flight:
     """One in-flight identity request that concurrent denials may share."""
 
-    __slots__ = ("seq", "event", "result", "error", "abandoned")
+    __slots__ = ("abandoned", "error", "event", "result", "seq")
 
     def __init__(self, seq: int):
         self.seq = seq

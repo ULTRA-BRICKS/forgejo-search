@@ -17,7 +17,6 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
-
 DEADLINE_REASON = "deadline_exceeded"
 
 

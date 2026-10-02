@@ -26,11 +26,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 
-import hypersearch  # noqa: E402
-from fake_forgejo import FakeForgejo  # noqa: E402
-from support import build_index  # noqa: E402
-from hypersearch.auth import ForgejoAuth  # noqa: E402
-from hypersearch.server import SearchServer  # noqa: E402
+from fake_forgejo import FakeForgejo
+from support import build_index
+
+import hypersearch
+from hypersearch.auth import ForgejoAuth
+from hypersearch.server import SearchServer
 
 COOKIE = "session=bench-alice"
 KINDS = {"list": "list_pages", "scoped": "scoped_pages", "identity": "identity_requests", "head": "head_probes"}
