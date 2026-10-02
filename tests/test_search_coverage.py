@@ -337,3 +337,47 @@ def test_ast_match_surplus_does_not_discard_bounded_success(tmp_path, controlled
     assert result["coverage"]["ast"] == {"status": "ran"}
     assert result["coverage"]["limits"]["results"]["state"] == "truncated"
     assert [(hit["mode"], hit["line"]) for hit in result["results"]] == [("ast", 1)]
+
+
+def test_ast_decoder_stops_at_request_deadline(tmp_path, controlled_ast, monkeypatch):
+    from hypersearch.deadline import RequestTimeout, request_deadline
+    root = fixture_repo(tmp_path)
+    db = open_database(tmp_path / "coverage.db")
+    index_all(db, root)
+    executable, _ = controlled_ast("many")
+    now = [0.0]
+    decoded = []
+    loads = json.loads
+
+    def decode_record(raw):
+        result = loads(raw)
+        decoded.append(True)
+        now[0] += 0.4
+        return result
+
+    monkeypatch.setattr("hypersearch.search.time.monotonic", lambda: now[0])
+    monkeypatch.setattr("hypersearch.search.json.loads", decode_record)
+    with request_deadline(1.0), pytest.raises(RequestTimeout):
+        search(db, "ast:restoreFocus($A)", {"acme/demo"}, ast_grep=executable)
+    assert len(decoded) <= 3
+
+
+@pytest.mark.parametrize("count", [1, 5])
+def test_blob_decoder_stops_at_request_deadline(monkeypatch, count):
+    import hypersearch.search as search_module
+    from hypersearch.deadline import RequestTimeout, request_deadline
+    now = [0.0]
+    decoded = []
+    output = b"".join(b"a blob 1\nx\n" for _ in range(count))
+    monkeypatch.setattr(search_module.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess([], 0, stdout=output))
+    monkeypatch.setattr(search_module.time, "monotonic", lambda: now[0])
+
+    def decode(data):
+        decoded.append(True)
+        now[0] += 1.1 if count == 1 else 0.4
+        return "x"
+
+    monkeypatch.setattr(search_module, "_decode_blob", decode)
+    with request_deadline(1.0), pytest.raises(RequestTimeout):
+        search_module._batch_blob_texts("unused", ["a"] * count, timeout=2)
+    assert len(decoded) <= 3

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 import time
+from concurrent.futures import CancelledError, ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .auth import VisibilityUnavailable
+from . import __version__
+from .auth import VisibilityUnavailable, probe_concurrency, probe_seconds
 from .db import indexed_repo_names
+from .deadline import RequestTimeout, check, request_deadline
 from .query import parse_query
 from .search import empty_coverage, scoped_repos, search
 
@@ -14,16 +20,24 @@ from .search import empty_coverage, scoped_repos, search
 class SearchServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, database, auth, ast_grep="ast-grep"):
+    def __init__(self, address, database, auth, ast_grep="ast-grep", *, request_budget=25, request_workers=8):
+        self.request_budget = probe_seconds(request_budget)
+        workers = probe_concurrency(request_workers)
+        self._slots = threading.BoundedSemaphore(workers)
+        self._requests = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="search-request")
         super().__init__(address, SearchHandler)
         self.database = database
         self.auth = auth
         self.ast_grep = ast_grep
         self.started = time.time()
 
+    def server_close(self):
+        super().server_close()
+        self._requests.shutdown(wait=False, cancel_futures=True)
+
 
 class SearchHandler(BaseHTTPRequestHandler):
-    server_version = "HyperSearch/0.1"
+    server_version = f"HyperSearch/{__version__}"
 
     def log_message(self, format, *args):
         pass
@@ -39,6 +53,45 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        deadline = time.monotonic() + self.server.request_budget
+        if urlparse(self.path).path == "/health":
+            return self._json(*self._response())
+        if not self.server._slots.acquire(blocking=False):
+            return self._json(503, {"error": "search_busy"})
+        try:
+            future = self.server._requests.submit(self._bounded_response, deadline)
+        except RuntimeError:
+            self.server._slots.release()
+            return self._json(503, {"error": "search_unavailable"})
+        except BaseException:
+            self.server._slots.release()
+            raise
+        future.add_done_callback(lambda _: self.server._slots.release())
+        try:
+            status, payload = future.result(timeout=max(0, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                raise RequestTimeout()
+        except CancelledError:
+            status, payload = 503, {"error": "search_unavailable"}
+        except (FutureTimeout, RequestTimeout):
+            status, payload = 503, {"error": "request_timeout"}
+        self._json(status, payload)
+
+    def _bounded_response(self, deadline):
+        with request_deadline(deadline):
+            try:
+                response = self._response()
+            except sqlite3.OperationalError:
+                check()
+                raise
+            check()
+            return response
+
+    @staticmethod
+    def _payload(status, payload):
+        return status, payload
+
+    def _response(self):
         # Wall-clock timer for total_ms spans the entire authenticated
         # request path, starting before the very first network round trip
         # (the session-visibility check below) through the code-ACL
@@ -52,7 +105,7 @@ class SearchHandler(BaseHTTPRequestHandler):
             with self.server.database.connection() as c:
                 repos = c.execute("SELECT count(*) FROM repos").fetchone()[0]
                 docs = c.execute("SELECT count(*) FROM documents").fetchone()[0]
-            return self._json(
+            return self._payload(
                 200,
                 {
                     "service": "hypersearch",
@@ -62,20 +115,21 @@ class SearchHandler(BaseHTTPRequestHandler):
                 },
             )
         if url.path != "/api/hypersearch":
-            return self._json(404, {"error": "not_found"})
+            return self._payload(404, {"error": "not_found"})
         cookie = self.headers.get("Cookie", "")
         try:
             authenticated, allowed = self.server.auth.visible_repositories(cookie)
         except VisibilityUnavailable as error:
-            return self._json(
+            return self._payload(
                 503,
                 {
                     "error": "visibility_unavailable",
                     "message": str(error),
                 },
             )
+        check()
         if not authenticated:
-            return self._json(401, {"error": "authentication_required"})
+            return self._payload(401, {"error": "authentication_required"})
         params = parse_qs(url.query)
         query = (params.get("q") or [""])[0].strip()
         try:
@@ -88,7 +142,7 @@ class SearchHandler(BaseHTTPRequestHandler):
             # ACLs -- it must stay cheap. Code-ACL narrowing is network-bound
             # per repo, so it must never run here; only past this point, once
             # there is an actual query to execute, is it worth the cost.
-            return self._json(
+            return self._payload(
                 200,
                 {
                     "query": "",
@@ -119,10 +173,11 @@ class SearchHandler(BaseHTTPRequestHandler):
         try:
             code_allowed = self.server.auth.code_readable_repositories(cookie, indexed)
         except VisibilityUnavailable as error:
-            return self._json(
+            return self._payload(
                 503,
                 {"error": "code_visibility_unavailable", "message": str(error)},
             )
+        check()
         started = time.perf_counter()
         result = search(
             self.server.database,
@@ -134,4 +189,4 @@ class SearchHandler(BaseHTTPRequestHandler):
         )
         result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         result["total_ms"] = round((time.perf_counter() - wall_started) * 1000, 2)
-        return self._json(200, result)
+        return self._payload(200, result)

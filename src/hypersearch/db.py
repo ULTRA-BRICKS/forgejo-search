@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from .deadline import active, check, expired, remaining
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -96,11 +98,14 @@ class Database:
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
-        connection = sqlite3.connect(self.path, timeout=10)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA busy_timeout=5000")
+        connection = sqlite3.connect(self.path, timeout=remaining(5))
         try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            connection.execute(f"PRAGMA busy_timeout={max(1, int(remaining(5) * 1000))}")
+            if active():
+                connection.set_progress_handler(lambda: int(expired()), 1000)
+            check()
             with connection:
                 yield connection
         finally:

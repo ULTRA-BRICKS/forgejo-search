@@ -33,3 +33,29 @@ def test_indexed_repo_names_chunks_large_candidate_sets(tmp_path):
     # An empty candidate set must short-circuit without touching the DB.
     with db.connection() as connection:
         assert indexed_repo_names(connection, set()) == set()
+
+
+def test_index_connections_do_not_install_request_progress_callback(tmp_path, monkeypatch):
+    import sqlite3
+    import time
+
+    from hypersearch.deadline import request_deadline
+    database = open_database(tmp_path / "deadline.db")
+    callbacks = []
+    original_connect = sqlite3.connect
+
+    class RecordingConnection(sqlite3.Connection):
+        def set_progress_handler(self, callback, steps):
+            callbacks.append(steps)
+            return super().set_progress_handler(callback, steps)
+
+    def connect(*args, **kwargs):
+        return original_connect(*args, factory=RecordingConnection, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    with database.connection() as connection:
+        assert connection.execute("SELECT count(*) FROM repos").fetchone()[0] == 0
+    assert callbacks == []
+    with request_deadline(time.monotonic() + 1), database.connection() as connection:
+        assert connection.execute("SELECT count(*) FROM repos").fetchone()[0] == 0
+    assert callbacks == [1000]

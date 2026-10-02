@@ -18,8 +18,11 @@ import urllib.request
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import copy_context
 from hashlib import sha256
 from urllib.parse import quote
+
+from .deadline import RequestTimeout, check, remaining
 
 DEFAULT_FORGEJO_URL = "http://127.0.0.1:3000"
 DEFAULT_FORGEJO_PUBLIC_HOST = "git.hyperide.ai"
@@ -245,8 +248,10 @@ class ForgejoAuth:
                 "Accept": "application/json",
             },
         )
-        with self._opener.open(request, timeout=self.request_timeout) as response:
-            return json.load(response)
+        with self._opener.open(request, timeout=remaining(self.request_timeout)) as response:
+            payload = json.load(response)
+            check()
+            return payload
 
     def _head(self, path: str, cookie: str) -> int:
         # HEAD is safe and correctly gated identically to GET for this route:
@@ -265,7 +270,7 @@ class ForgejoAuth:
                 "X-Forwarded-Proto": "https",
             },
         )
-        with self._opener.open(request, timeout=self.request_timeout) as response:
+        with self._opener.open(request, timeout=remaining(self.request_timeout)) as response:
             return int(response.status)
 
     def _remember(
@@ -365,12 +370,16 @@ class ForgejoAuth:
             raise VisibilityUnavailable(
                 f"Forgejo repository visibility check failed with HTTP {error.code} on page {page}"
             ) from error
+        except RequestTimeout:
+            raise
         except (*_TRANSPORT_ERRORS, VisibilityUnavailable) as error:
+            check()
             raise VisibilityUnavailable(
                 f"Forgejo repository visibility check failed on page {page}"
             ) from error
 
     def visible_repositories(self, cookie: str) -> tuple[bool, set[str]]:
+        check()
         if not cookie:
             return False, set()
 
@@ -380,15 +389,20 @@ class ForgejoAuth:
         if cached is not _MISS:
             return cached
 
-        event, leader = self._claim(key)
-        if not leader:
-            if not event.wait(timeout=max(10.0, self.request_timeout * 3)):
+        while True:
+            check()
+            event, leader = self._claim(key)
+            if leader:
+                break
+            if not event.wait(timeout=remaining(max(10.0, self.request_timeout * 3))):
                 raise VisibilityUnavailable("Forgejo visibility check timed out")
+            check()
             self._backoff(key)
             cached = self._cached(key)
-            if cached is _MISS:
-                raise VisibilityUnavailable("Forgejo visibility check failed")
-            return cached
+            if cached is not _MISS:
+                return cached
+            # A cancelled leader publishes neither a grant nor a backoff.
+            # Reclaim singleflight using this follower's remaining budget.
 
         revoked = self._start_check(key)
         try:
@@ -403,6 +417,7 @@ class ForgejoAuth:
             # Only the session-authenticated web route accepts browser cookies;
             # token-only REST routes cannot establish this viewer's identity.
             batch = self._fetch_page(cookie, 1)
+            check()
             if batch is None:
                 self._remember(key, False, set(), self.negative_ttl)
                 return False, set()
@@ -415,7 +430,9 @@ class ForgejoAuth:
             # `len(batch) == _PAGE_SIZE`.
             if batch:
                 for page in range(2, _MAX_PAGES + 1):
+                    check()
                     batch = self._fetch_page(cookie, page)
+                    check()
                     if batch is None:
                         self._remember(key, False, set(), self.negative_ttl)
                         raise VisibilityUnavailable(
@@ -432,12 +449,13 @@ class ForgejoAuth:
                     repositories.update(self._full_names(batch))
 
             with self._guard:
+                check()
                 if revoked.is_set():
                     raise VisibilityUnavailable("Forgejo session was revoked during pagination")
-                remaining = checked_at + self.ttl - time.monotonic()
-                if remaining <= 0:
+                grant_remaining = checked_at + self.ttl - time.monotonic()
+                if grant_remaining <= 0:
                     raise VisibilityUnavailable("Forgejo visibility grant expired during pagination")
-                self._remember(key, True, repositories, remaining)
+                self._remember(key, True, repositories, grant_remaining)
                 return True, repositories
         except VisibilityUnavailable as error:
             self._remember_unavailable(key, error)
@@ -516,6 +534,7 @@ class ForgejoAuth:
         # Bound stale grants from probe start, not the end of a slow response.
         ttl = self.ttl if allowed else self.negative_ttl
         with self._guard:
+            check()
             if revoked.is_set():
                 raise VisibilityUnavailable("Forgejo session was revoked during authorization")
             session = self.cache.get(key.partition(":")[0])
@@ -534,6 +553,7 @@ class ForgejoAuth:
     def _code_readable(
         self, cookie: str, repo: str, request_revoked: threading.Event
     ) -> tuple[float, bool]:
+        check()
         with self._session_check(cookie) as revoked:
             if request_revoked.is_set():
                 raise VisibilityUnavailable("Forgejo session was revoked before the probe started")
@@ -559,7 +579,10 @@ class ForgejoAuth:
                 ):
                     self._session_revoked(cookie)
                 status = error.code
+            except RequestTimeout:
+                raise
             except _TRANSPORT_ERRORS as error:
+                check()
                 raise VisibilityUnavailable(
                     "Forgejo code visibility check failed"
                 ) from error
@@ -627,7 +650,7 @@ class ForgejoAuth:
             # its worker threads entirely.
             return readable
 
-        deadline = time.monotonic() + self.code_probe_budget
+        deadline = time.monotonic() + remaining(self.code_probe_budget)
         with self._guard:
             if self._closed:
                 raise VisibilityUnavailable("Forgejo authorization is closed")
@@ -660,6 +683,7 @@ class ForgejoAuth:
         try:
             with self._capacity:
                 while pending or futures:
+                    check()
                     if revoked.is_set():
                         raise VisibilityUnavailable("Forgejo session was revoked during authorization")
                     budget_left = deadline - time.monotonic()
@@ -669,12 +693,21 @@ class ForgejoAuth:
                     for future in list(futures):
                         if future.done():
                             repo, probe_revoked = futures.pop(future)
-                            expires, allowed = future.result()
+                            try:
+                                expires, allowed = future.result()
+                            except RequestTimeout:
+                                # A shared worker may belong to an expired leader.
+                                # A live follower retries only after that work ends.
+                                check()
+                                completed(self._code_key(cookie, repo), future)
+                                pending.append(repo)
+                                continue
                             if probe_revoked.is_set():
                                 raise VisibilityUnavailable("Forgejo session was revoked before probe publication")
                             if allowed:
                                 readable[repo] = expires
                     while pending:
+                        check()
                         self._backoff("code:" + sha256(cookie.encode()).hexdigest())
                         repo = pending[-1]
                         key = self._code_key(cookie, repo)
@@ -691,7 +724,7 @@ class ForgejoAuth:
                             session_key = key.partition(":")[0]
                             probe_revoked = self._start_check(session_key)
                             try:
-                                future = executor.submit(self._code_readable, cookie, repo, probe_revoked)
+                                future = executor.submit(copy_context().run, self._code_readable, cookie, repo, probe_revoked)
                             except BaseException:
                                 self._finish_check(session_key, probe_revoked)
                                 raise

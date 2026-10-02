@@ -19,6 +19,8 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .db import Database
+from .deadline import check
+from .deadline import remaining as budget_remaining
 from .query import (
     SearchQuery,
     code_tokens,
@@ -519,7 +521,7 @@ def _batch_blob_texts(
             ["git", "--git-dir", repo_path, "cat-file", "--batch"],
             input=("".join(oid + "\n" for oid in oids)).encode(),
             capture_output=True,
-            timeout=timeout,
+            timeout=budget_remaining(timeout),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired):
@@ -531,6 +533,7 @@ def _batch_blob_texts(
     offset = 0
     decoded: dict[str, str] = {}
     for requested in oids:
+        check()
         end = output.find(b"\n", offset)
         if end < 0:
             break
@@ -553,6 +556,7 @@ def _batch_blob_texts(
         text = _decode_blob(body)
         if text is not None:
             decoded[requested] = text
+    check()
     return decoded
 
 
@@ -567,6 +571,7 @@ def _candidate_blob_texts(rows: list[sqlite3.Row]) -> dict[tuple[str, str], str]
     deadline = time.monotonic() + 1.25
     decoded: dict[tuple[str, str], str] = {}
     for repo_path, oids in groups.items():
+        check()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
@@ -651,7 +656,7 @@ def _run_ast(
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=budget_remaining(2),
             check=False,
         )
     except subprocess.TimeoutExpired:
@@ -669,6 +674,7 @@ def _run_ast(
     resolved_files: dict[str, sqlite3.Row] = {}
     # JSON-stream framing is LF, not Unicode's broader splitlines boundaries.
     for record in re.finditer(r"[^\n]+", process.stdout):
+        check()
         if time.monotonic() >= deadline:
             return [], "timeout"
         raw = record.group()
@@ -705,6 +711,7 @@ def _run_ast(
         )
         if len(hits) >= limit:
             break
+    check()
     if time.monotonic() >= deadline:
         return [], "timeout"
     return hits, "ran"
@@ -728,6 +735,7 @@ def search(
     # never has a code-ACL layer to narrow against.
     code_allowed: set[str] | None = None,
 ) -> dict:
+    check()
     q = parse_query(query)
     limit = max(1, min(int(limit), 100))
     coverage = empty_coverage(limit)
@@ -782,6 +790,7 @@ def search(
             stages["ast_files"]["state"] = files_state
             hits.extend(ast_hits)
 
+    check()
     seen: set[tuple] = set()
     merged: list[dict] = []
     for hit in sorted(hits, key=lambda item: -item.score):

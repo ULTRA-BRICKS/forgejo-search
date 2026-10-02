@@ -47,6 +47,10 @@ def parser():
         default=os.getenv("HYPERSEARCH_PUBLIC_HOST", DEFAULT_FORGEJO_PUBLIC_HOST),
     )
     serve.add_argument("--ast-grep", default="ast-grep")
+    serve.add_argument("--request-budget", type=probe_seconds, default=25,
+                       help="total search request deadline in seconds (default 25)")
+    serve.add_argument("--request-workers", type=probe_concurrency, default=8,
+                       help="maximum unfinished search requests (default 8)")
     serve.add_argument(
         "--code-probe-budget", type=probe_seconds,
         default=os.getenv("HYPERSEARCH_CODE_PROBE_BUDGET", "10"),
@@ -104,6 +108,8 @@ def main(argv=None):
             code_cache_max_entries=args.code_cache_max_entries,
         ),
         args.ast_grep,
+        request_budget=args.request_budget,
+        request_workers=args.request_workers,
     )
     print(f"HyperSearch listening on {args.host}:{args.port}", flush=True)
     try:

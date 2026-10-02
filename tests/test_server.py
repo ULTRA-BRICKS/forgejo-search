@@ -33,8 +33,8 @@ class FakeAuth:
 
 
 @contextmanager
-def running_server(db, auth, ast_grep="missing-ast-grep"):
-    instance = SearchServer(("127.0.0.1", 0), db, auth, ast_grep)
+def running_server(db, auth, ast_grep="missing-ast-grep", **kwargs):
+    instance = SearchServer(("127.0.0.1", 0), db, auth, ast_grep, **kwargs)
     thread = threading.Thread(target=instance.serve_forever, daemon=True)
     thread.start()
     try:
@@ -394,3 +394,293 @@ def test_locked_repo_name_hit_never_discloses_its_revision_sha(tmp_path):
     # The raw HEAD SHA of a code-denied repo must never appear anywhere in
     # the response body, not merely be absent from one field's key.
     assert locked_head not in raw.decode()
+
+
+def test_request_deadline_retains_worker_capacity_until_blocked_auth_finishes(tmp_path):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockedAuth(FakeAuth):
+        def visible_repositories(self, cookie):
+            entered.set()
+            release.wait(3)
+            return super().visible_repositories(cookie)
+
+    db = open_database(tmp_path / "search.db")
+    with running_server(db, BlockedAuth(), request_budget=0.05, request_workers=1) as base:
+        try:
+            started = time.monotonic()
+            status, body = get_json(base, "/api/hypersearch?q=test", "session=alice")
+            assert entered.is_set()
+            assert status == 503
+            assert body == {"error": "request_timeout"}
+            assert time.monotonic() - started < 0.5
+            status, body = get_json(base, "/api/hypersearch?q=test", "session=alice")
+            assert (status, body) == (503, {"error": "search_busy"})
+            assert get_json(base, "/health")[0] == 200
+        finally:
+            release.set()
+        for _ in range(50):
+            status, body = get_json(base, "/api/hypersearch", "session=alice")
+            if status == 200:
+                break
+            time.sleep(0.01)
+        assert status == 200
+
+
+def test_cold_pagination_deadline_stops_pages_and_does_not_cache_late_grant(tmp_path):
+    from hypersearch.auth import ForgejoAuth
+    auth = ForgejoAuth("http://unused")
+    pages = []
+
+    def fetch(cookie, page):
+        pages.append(page)
+        time.sleep(0.08)
+        return [{"repository": {"full_name": "acme/demo"}}]
+
+    auth._fetch_page = fetch
+    db = open_database(tmp_path / "search.db")
+    try:
+        with running_server(db, auth, request_budget=0.03, request_workers=1) as base:
+            status, body = get_json(base, "/api/hypersearch?q=test", "session=alice")
+            assert (status, body) == (503, {"error": "request_timeout"})
+            time.sleep(0.15)
+            assert pages == [1]
+            assert not auth.cache
+    finally:
+        auth.close()
+
+
+def test_visibility_and_code_share_request_budget(tmp_path, monkeypatch):
+    from hypersearch import server as server_module
+    searched = []
+
+    class SlowPhases(FakeAuth):
+        def visible_repositories(self, cookie):
+            time.sleep(0.04)
+            return super().visible_repositories(cookie)
+
+        def code_readable_repositories(self, cookie, repos):
+            time.sleep(0.08)
+            return set(repos)
+
+    monkeypatch.setattr(server_module, "search", lambda *a, **kw: searched.append(True))
+    db = open_database(tmp_path / "search.db")
+    with running_server(db, SlowPhases(), request_budget=0.08) as base:
+        started = time.monotonic()
+        status, body = get_json(base, "/api/hypersearch?q=test", "session=alice")
+        assert (status, body) == (503, {"error": "request_timeout"})
+        assert time.monotonic() - started < 0.3
+        time.sleep(0.1)
+        assert not searched
+
+
+@pytest.mark.parametrize("request_budget", [0.03, 1.0])
+def test_expired_code_worker_cannot_publish_grant(request_budget):
+    from hypersearch.auth import ForgejoAuth
+    from hypersearch.deadline import RequestTimeout, request_deadline
+    auth = ForgejoAuth("http://unused", code_probe_budget=0.03)
+    finished = threading.Event()
+
+    def head(path, cookie):
+        time.sleep(0.1)
+        finished.set()
+        return 200
+
+    auth._head = head
+    try:
+        with (
+            request_deadline(time.monotonic() + request_budget),
+            pytest.raises((RequestTimeout, VisibilityUnavailable)),
+        ):
+            auth.code_readable_repositories("session=alice", {"acme/demo"})
+        assert finished.wait(1)
+    finally:
+        auth.close()
+    assert not auth._code_cache
+
+
+@pytest.mark.parametrize("phase", ["visibility", "code"])
+def test_transport_deadline_does_not_poison_session_backoff(phase):
+    from hypersearch.auth import ForgejoAuth
+    from hypersearch.deadline import RequestTimeout, request_deadline
+    auth = ForgejoAuth("http://unused")
+
+    def expired(*args):
+        time.sleep(0.04)
+        raise RequestTimeout()
+
+    auth._get = expired
+    auth._head = expired
+    try:
+        with (
+            request_deadline(time.monotonic() + 0.01),
+            pytest.raises(RequestTimeout),
+        ):
+            if phase == "visibility":
+                auth.visible_repositories("session=alice")
+            else:
+                auth.code_readable_repositories("session=alice", {"acme/demo"})
+    finally:
+        auth.close()
+    assert not auth._unavailable
+
+
+def test_shared_code_probe_expiry_does_not_cancel_valid_follower():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from hypersearch.auth import ForgejoAuth
+    from hypersearch.deadline import RequestTimeout, request_deadline
+    auth = ForgejoAuth("http://unused")
+    entered = threading.Event()
+    calls = []
+
+    def head(path, cookie):
+        calls.append(path)
+        entered.set()
+        time.sleep(0.12)
+        return 200
+
+    auth._head = head
+
+    def query(budget):
+        with request_deadline(time.monotonic() + budget):
+            return auth.code_readable_repositories("session=alice", {"acme/demo"})
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(query, 0.05)
+            assert entered.wait(1)
+            follower = executor.submit(query, 1.0)
+            with pytest.raises(RequestTimeout):
+                leader.result(timeout=2)
+            assert follower.result(timeout=2) == {"acme/demo"}
+        assert len(calls) == 2
+        assert not auth._unavailable
+    finally:
+        auth.close()
+
+
+def test_visibility_follower_reclaims_after_cancelled_leader():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from hypersearch.auth import ForgejoAuth
+    from hypersearch.deadline import RequestTimeout, request_deadline
+    auth = ForgejoAuth("http://unused")
+    entered = threading.Event()
+    calls = []
+
+    def page(cookie, number):
+        calls.append(number)
+        entered.set()
+        time.sleep(0.08)
+        return []
+
+    auth._fetch_page = page
+
+    def query(budget):
+        with request_deadline(time.monotonic() + budget):
+            return auth.visible_repositories("session=alice")
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            leader = executor.submit(query, 0.03)
+            assert entered.wait(1)
+            follower = executor.submit(query, 1.0)
+            with pytest.raises(RequestTimeout):
+                leader.result(timeout=2)
+            assert follower.result(timeout=2) == (True, set())
+        assert calls == [1, 1]
+    finally:
+        auth.close()
+
+
+def test_health_is_exempt_from_search_budget(tmp_path):
+    database = open_database(tmp_path / "search.db")
+
+    class SlowHealthDatabase:
+        @contextmanager
+        def connection(self):
+            time.sleep(0.05)
+            with database.connection() as connection:
+                yield connection
+
+    with running_server(SlowHealthDatabase(), FakeAuth(), request_budget=0.01) as base:
+        status, body = get_json(base, "/health")
+        assert status == 200
+        assert body["service"] == "hypersearch"
+
+
+def test_shutdown_submit_race_returns_controlled_response(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def shutdown_submit(self, *args, **kwargs):
+        raise RuntimeError("cannot schedule new futures after shutdown")
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", shutdown_submit)
+    db = open_database(tmp_path / "search.db")
+    with running_server(db, FakeAuth()) as base:
+        assert get_json(base, "/api/hypersearch", "session=alice") == (
+            503, {"error": "search_unavailable"}
+        )
+
+
+def test_service_sigterm_exits_with_timed_out_blocked_worker(tmp_path):
+    import signal
+    import sys
+
+    port_file = tmp_path / "port"
+    script = '''
+import sys, threading
+from pathlib import Path
+from hypersearch.db import open_database
+from hypersearch.server import SearchServer
+class BlockedAuth:
+    def visible_repositories(self, cookie):
+        threading.Event().wait()
+server = SearchServer(("127.0.0.1",0),open_database(sys.argv[1]),BlockedAuth(),request_budget=0.02)
+Path(sys.argv[2]).write_text(str(server.server_port))
+try:
+    server.serve_forever()
+finally:
+    server.server_close()
+'''
+    process = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path / "service.db"), str(port_file)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    try:
+        for _ in range(200):
+            if port_file.exists():
+                break
+            if process.poll() is not None:
+                pytest.fail("service exited before readiness")
+            time.sleep(0.01)
+        assert port_file.exists()
+        base = f"http://127.0.0.1:{port_file.read_text()}"
+        assert get_json(base, "/api/hypersearch", "session=alice") == (
+            503, {"error": "request_timeout"}
+        )
+        process.terminate()
+        assert process.wait(timeout=2) == -signal.SIGTERM
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+        process.communicate(timeout=2)
+
+
+def test_shutdown_cancelled_queue_returns_controlled_response(tmp_path, monkeypatch):
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    def cancelled_submit(self, *args, **kwargs):
+        future = Future()
+        future.cancel()
+        return future
+
+    monkeypatch.setattr(ThreadPoolExecutor, "submit", cancelled_submit)
+    db = open_database(tmp_path / "search.db")
+    with running_server(db, FakeAuth()) as base:
+        assert get_json(base, "/api/hypersearch", "session=alice") == (
+            503, {"error": "search_unavailable"}
+        )

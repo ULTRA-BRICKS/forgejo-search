@@ -186,28 +186,37 @@ must match that mount's login path and either the internal authority or
 
 | Flag | Environment variable | Default | Valid range |
 | --- | --- | --- | --- |
+| `--request-budget` | — | 25 seconds | finite, >0 through 120 |
+| `--request-workers` | — | 8 | integer 1–64 |
 | `--code-probe-budget` | `HYPERSEARCH_CODE_PROBE_BUDGET` | 10 seconds | finite, >0 through 120 |
 | `--code-probe-concurrency` | `HYPERSEARCH_CODE_PROBE_CONCURRENCY` | 8 | integer 1–64 |
 | `--request-timeout` | `HYPERSEARCH_REQUEST_TIMEOUT` | 2 seconds | finite, >0 through 120 |
 | `--code-cache-max-entries` | `HYPERSEARCH_CODE_CACHE_MAX_ENTRIES` | 8192 | integer 1–1000000 |
 
-The code-probe deadline includes waiting for capacity, but not the earlier
-repository-visibility pagination or search execution. Workers and admitted probes
-are bounded across all sessions in one service process, not multiplied per query.
-A deadline or upstream failure returns no partial result. Running probes may finish
-after the caller's deadline; they retain their shared slots until completion.
-Overlapping checks for the same session/repository share one future before worker
-admission. Released capacity wakes pending requests even while their other probes
-are still running.
-The request timeout is a socket timeout, not a hard whole-response deadline.
-Multiple service processes each have their own pool and caches.
-The caller owns `ForgejoAuth` and must call its idempotent `close()` after stopping
-HTTP requests; the CLI does so when its serve loop exits. Shutdown joins admitted
-probes rather than abandoning their worker threads.
-The deployment's nginx 15-second timeout is not an end-to-end authorization guarantee:
-cold visibility pagination precedes the code-probe budget, and socket timeouts do not
-cap total response duration. Release acceptance must measure the full authenticated
-request, not label the code-probe budget as its end-to-end deadline.
+The search HTTP request has one total deadline covering visibility pagination, code ACLs,
+capacity waits and search. The code-probe budget and each socket/subprocess timeout
+are capped by its remaining time. Expiry returns 503 `request_timeout` without
+partial results. Configure the proxy above this total budget (recommended: 30s
+proxy for the 25s backend default).
+
+The `/health` liveness endpoint is independent of search admission and the search
+deadline; its SQLite reads retain the database connection's normal busy timeout.
+
+At most `--request-workers` unfinished search operations run per process. Excess
+requests receive 503 `search_busy` immediately. A blocked upstream operation retains
+its slot after the HTTP deadline until it actually ends; repeated timeouts cannot
+create unlimited background work. No subsequent page/probe is scheduled after expiry,
+and late authorization results cannot publish fresh grants. Python cannot forcibly
+interrupt a running transport thread; socket timeouts are inactivity limits, so a
+trickling peer can occupy one of these bounded slots until its read finishes.
+
+Code workers are separately bounded across all sessions. Overlapping checks for
+the same session/repository share one future before admission. All worker pools
+and caches are per service process. The caller owns `ForgejoAuth` and must call its
+idempotent `close()` after stopping HTTP requests; the CLI does so when its serve
+loop exits. Shutdown joins admitted code probes. Request shutdown rejects queued
+work without waiting for blocked request workers; process termination remains the
+service manager's responsibility.
 
 Cold unscoped searches still probe **every visible, indexed repository**, not just
 repositories with text matches. `repo:` and `owner:` narrow candidates before probing;
@@ -216,7 +225,9 @@ requests until expiry or eviction. Each cold `404` adds an identity recheck.
 Increase capacity only with measured upstream headroom; never bypass code permission
 checks or lengthen permission TTLs to hide overload.
 
-The source package version is 0.3.0 for additive viewer-visible coverage. Deployment
+The source package version is 0.3.1 for bounded request deadlines.
+`pyproject.toml` declares the release version; the runtime reads that declaration
+in a source checkout and distribution metadata when installed. Deployment
 still identifies the runtime by its full vendored source revision, not package
 metadata: the infrastructure owner must update both REVISION and VERSION when
 integrating this source. A source pull request does not update the running service.
