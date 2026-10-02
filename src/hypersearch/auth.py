@@ -402,8 +402,10 @@ class ForgejoAuth:
 
         The budget is twice the socket timeout, clamped by the bound request's remaining
         time; at that instant a watchdog shuts the socket down, which wakes a blocked read.
-        Not covered: DNS resolution (blocking `getaddrinfo`) and the TCP connect, which are
-        bounded only by the socket timeout; use an IP-literal base to avoid DNS.
+        Not covered: DNS resolution (blocking `getaddrinfo`, which the Python socket timeout
+        does NOT bound) and TLS handshakes. The watchdog is armed after the connect returns, so
+        the lifetime holds for a plain-HTTP, IP-literal base (the deployed local-Forgejo shape);
+        the TCP connect to such an address is bounded by the socket timeout.
         """
         budget = scope.clamp(2 * self.request_timeout)
         timers: list = []
