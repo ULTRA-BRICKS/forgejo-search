@@ -95,9 +95,11 @@ def _is_safe_repo_full_name(full_name: str) -> bool:
 # truncated read (http.client.IncompleteRead). All must fail closed with an
 # explicit VisibilityUnavailable rather than crash the handler or be silently
 # treated as "not authenticated".
+# Socket reads and watchdog shutdowns may raise a plain OSError, including
+# ConnectionResetError, rather than wrapping it in urllib.error.URLError.
 _TRANSPORT_ERRORS = (
     urllib.error.URLError,
-    TimeoutError,
+    OSError,
     ValueError,
     http.client.HTTPException,
 )
