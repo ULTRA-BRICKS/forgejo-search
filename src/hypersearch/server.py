@@ -55,7 +55,7 @@ class SearchHandler(BaseHTTPRequestHandler):
             return self._json(404, {"error": "not_found"})
         cookie = self.headers.get("Cookie", "")
         try:
-            login, allowed = self.server.auth.visible_repositories(cookie)
+            authenticated, allowed = self.server.auth.visible_repositories(cookie)
         except VisibilityUnavailable as error:
             return self._json(
                 503,
@@ -64,22 +64,41 @@ class SearchHandler(BaseHTTPRequestHandler):
                     "message": str(error),
                 },
             )
-        if not login:
+        if not authenticated:
             return self._json(401, {"error": "authentication_required"})
+        # Repository visibility is not code visibility in Forgejo: a user may
+        # have access to issues/projects while TypeCode is denied. Only indexed
+        # repositories need the stronger native reqRepoCodeReader probe.
+        with self.server.database.connection() as connection:
+            indexed = {
+                row[0]
+                for row in connection.execute("SELECT full_name FROM repos").fetchall()
+            }
+        try:
+            code_allowed = self.server.auth.code_readable_repositories(
+                cookie, allowed & indexed
+            )
+        except VisibilityUnavailable as error:
+            return self._json(
+                503,
+                {"error": "code_visibility_unavailable", "message": str(error)},
+            )
         params = parse_qs(url.query)
         query = (params.get("q") or [""])[0].strip()
         if not query:
-            return self._json(
-                200, {"query": "", "mode": "auto", "results": [], "user": login}
-            )
+            return self._json(200, {"query": "", "mode": "auto", "results": []})
         try:
             limit = int((params.get("limit") or ["30"])[0])
         except ValueError:
             limit = 30
         started = time.perf_counter()
         result = search(
-            self.server.database, query, allowed, limit, self.server.ast_grep
+            self.server.database,
+            query,
+            allowed,
+            limit,
+            self.server.ast_grep,
+            code_allowed=code_allowed,
         )
-        result["user"] = login
         result["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 2)
         return self._json(200, result)

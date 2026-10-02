@@ -339,3 +339,22 @@ def test_intent_ranking_prefers_repository_name_over_text_occurrences(tmp_path):
     index_all(db, root)
     result = search(db, "demo", {"acme/demo"})
     assert result["results"][0]["kind"] == "repository"
+
+
+def test_repository_visibility_does_not_imply_code_visibility(tmp_path):
+    root = fixture_repo(tmp_path)
+    db = open_database(tmp_path / "search.db")
+    index_all(db, root)
+    visible = {"acme/demo"}
+
+    repo_result = search(db, "demo", visible, code_allowed=set())
+    assert any(hit["kind"] == "repository" for hit in repo_result["results"])
+
+    file_result = search(db, "focus.js", visible, code_allowed=set())
+    assert file_result["results"] == []
+
+    symbol_result = search(db, "restoreFocus", visible, code_allowed=set())
+    assert symbol_result["results"] == []
+
+    ast_result = search(db, "restoreFocus(trigger)", visible, code_allowed=set())
+    assert ast_result["results"] == []

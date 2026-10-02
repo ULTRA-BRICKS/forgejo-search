@@ -569,22 +569,25 @@ def search(
     allowed: set[str],
     limit: int = 30,
     ast_grep: str = "ast-grep",
+    *,
+    code_allowed: set[str] | None = None,
 ) -> dict:
     q = parse_query(query)
     limit = max(1, min(int(limit), 100))
     if not allowed:
         return {"query": q.raw, "mode": q.mode, "results": []}
 
+    code_scope = allowed if code_allowed is None else (allowed & code_allowed)
     hits: list[SearchHit] = []
     with database.connection() as connection:
         hits.extend(_repo_hits(connection, q, allowed, limit))
-        if q.file_candidate:
-            hits.extend(_file_hits(connection, q, allowed, limit))
-        if q.symbol_candidate and q.symbol_role != "reference":
-            hits.extend(_symbol_hits(connection, q, allowed, limit))
+        if q.file_candidate and code_scope:
+            hits.extend(_file_hits(connection, q, code_scope, limit))
+        if q.symbol_candidate and q.symbol_role != "reference" and code_scope:
+            hits.extend(_symbol_hits(connection, q, code_scope, limit))
         rows = (
-            _fts_rows(connection, q, allowed, max(limit, 40))
-            if q.text and q.mode != "file"
+            _fts_rows(connection, q, code_scope, max(limit, 40))
+            if q.text and q.mode != "file" and code_scope
             else []
         )
         if q.symbol_role == "reference":
@@ -593,7 +596,11 @@ def search(
         else:
             hits.extend(_fts_hits(rows[:limit], q))
         if q.ast_candidate:
-            ast_rows = rows or _ast_scope_rows(connection, q, allowed, max(limit, 40))
+            ast_rows = rows or (
+                _ast_scope_rows(connection, q, code_scope, max(limit, 40))
+                if code_scope
+                else []
+            )
             hits.extend(_signature_hits(ast_rows, q))
             hits.extend(_ast_hits(ast_rows, q, limit, ast_grep))
 

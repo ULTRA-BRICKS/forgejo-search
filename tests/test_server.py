@@ -18,8 +18,13 @@ class FakeAuth:
         if cookie == "visibility-error":
             raise VisibilityUnavailable("upstream visibility failed")
         if cookie != "session=alice":
-            return None, set()
-        return "alice", {"acme/demo"}
+            return False, set()
+        return True, {"acme/demo"}
+
+    def code_readable_repositories(self, cookie: str, repos: set[str]):
+        if cookie == "code-visibility-error":
+            raise VisibilityUnavailable("upstream code visibility failed")
+        return set(repos)
 
 
 @pytest.fixture
@@ -77,7 +82,7 @@ def test_visibility_failure_is_explicit_503(server):
     assert payload["error"] == "visibility_unavailable"
 
 
-def test_empty_query_keeps_identity_but_returns_no_rows(server):
+def test_empty_query_stays_authenticated_but_returns_no_rows(server):
     status, payload = get_json(
         server,
         "/api/hypersearch?q=",
@@ -88,7 +93,6 @@ def test_empty_query_keeps_identity_but_returns_no_rows(server):
         "query": "",
         "mode": "auto",
         "results": [],
-        "user": "alice",
     }
 
 
@@ -99,6 +103,5 @@ def test_authenticated_query_cannot_escape_empty_index(server):
         cookie="session=alice",
     )
     assert status == 200
-    assert payload["user"] == "alice"
     assert payload["results"] == []
     assert payload["elapsed_ms"] >= 0
