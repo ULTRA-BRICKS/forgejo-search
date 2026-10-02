@@ -698,6 +698,13 @@ class ForgejoAuth:
         first empty one was fetched": the plan always includes one page past the last
         populated page, and the caller keeps walking sequentially if that sentinel (or a
         page after an understated count) turns out to hold rows.
+
+        The plan is issued in page order, at most `visibility_concurrency` pages at a time,
+        and nothing further is issued once a page came back empty or as a login redirect:
+        an overstated count costs at most the pages already issued, not the whole bound.
+        Every page before that one is still awaited (an empty page arriving out of order
+        discards nothing), and so is every later page already on the wire, so a logout it
+        carries is still seen; later pages that have not started are dropped.
         """
         total = getattr(first, "total", None)
         if self.visibility_concurrency <= 1 or total is None or not first:
@@ -707,24 +714,27 @@ class ForgejoAuth:
         pages = list(range(2, min(populated + 1, _MAX_PAGES) + 1))
         if len(pages) < 2:
             return {}
-        executor = self._page_pool()
-        futures = {
-            executor.submit(contextvars.copy_context().run, self._fetch_page, cookie, page, suffix): page
-            for page in pages
-        }
-        for future in futures:
-            future.add_done_callback(lambda _: self._wake())
+        futures: dict[Future, int] = {}
         context = scope.current()
         unregister = context.on_cancel(self._wake) if context is not None else None
-        pending = set(futures)
+        pending: set[Future] = set()
         results: dict[int, list | None] = {}
+        issued = 0
+        end: int | None = None
         try:
             with self._capacity:
-                while pending:
+                while True:
                     for future in [future for future in pending if future.done()]:
                         pending.discard(future)
-                        results[futures[future]] = future.result()
-                    if not pending:
+                        rows = results[futures[future]] = future.result()
+                        if not rows and (end is None or futures[future] < end):
+                            end = futures[future]
+                    if end is not None:
+                        issued = len(pages)
+                        for future in [future for future in pending if futures[future] > end]:
+                            if future.cancel():
+                                pending.discard(future)
+                    if not pending and issued == len(pages):
                         break
                     if revoked.is_set():
                         raise VisibilityUnavailable("Forgejo session was revoked during pagination")
@@ -734,7 +744,21 @@ class ForgejoAuth:
                         remaining = context.remaining()
                         if remaining is not None:
                             pause = min(pause, remaining)
-                    self._capacity.wait(pause)
+                    while issued < len(pages) and len(pending) < self.visibility_concurrency:
+                        future = self._page_pool().submit(
+                            contextvars.copy_context().run,
+                            self._fetch_page,
+                            cookie,
+                            pages[issued],
+                            suffix,
+                        )
+                        futures[future] = pages[issued]
+                        issued += 1
+                        pending.add(future)
+                        future.add_done_callback(lambda _: self._wake())
+                    # A page that finished before its callback was attached woke nobody.
+                    if not any(future.done() for future in pending):
+                        self._capacity.wait(pause)
             return results
         except BaseException as error:
             running = [future for future in pending if not future.cancel()]
@@ -1024,6 +1048,21 @@ class ForgejoAuth:
             self._check_session_state(cookie)
             if revoked.is_set():
                 raise VisibilityUnavailable("Forgejo session was revoked during authorization")
+        finally:
+            self._finish_check(key, revoked)
+
+    @contextmanager
+    def session_watch(self, cookie: str):
+        """Yield an event that is set once any request observes this session's logout.
+
+        It costs no upstream request and does not depend on the negative cache entry, so a
+        caller still holding a result can refuse to publish it after a logout that is
+        already known here. It proves nothing about a logout nobody has observed.
+        """
+        key = sha256(cookie.encode()).hexdigest()
+        revoked = self._start_check(key)
+        try:
+            yield revoked
         finally:
             self._finish_check(key, revoked)
 

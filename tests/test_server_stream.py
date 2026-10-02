@@ -49,6 +49,10 @@ class ScriptedAuth:
         self._phase()
         return cookie == "session=alice"
 
+    @contextmanager
+    def session_watch(self, cookie):
+        yield threading.Event()
+
     def visible_repositories(self, cookie, repo=None):
         self._phase()
         if cookie != "session=alice":
@@ -741,6 +745,74 @@ def test_real_auth_streams_heartbeats_through_a_slow_cold_listing(tmp_path):
     assert fake.count("list") == 16 and fake.count("identity") == 0
     first_heartbeat = next(t for t, r in stream.seen if r["type"] == "heartbeat")
     assert first_heartbeat < stream.seen[-2][0]
+
+
+@pytest.mark.parametrize("accept", ["application/x-ndjson", "application/json"])
+def test_a_logout_observed_while_a_result_is_held_is_never_published(tmp_path, monkeypatch, accept):
+    # Both allow-lists were valid when they were returned. While this request is still
+    # searching, another call of the same session sees Forgejo's login redirect.
+    from hypersearch import server as server_module
+
+    visible = ["acme/open", "acme/other"]
+    fake = FakeForgejo(visible, visible)
+    db = build_index(tmp_path / "search.db", ["acme/open"], text="needle")
+    auth = ForgejoAuth(fake.base)
+    searching, release = threading.Event(), threading.Event()
+    real_search = server_module.search
+
+    def held(*args, **kwargs):
+        result = real_search(*args, **kwargs)
+        searching.set()
+        release.wait(5)
+        return result
+
+    monkeypatch.setattr(server_module, "search", held)
+    answer: dict = {}
+
+    def client(base):
+        # A JSON response has no headers until the work ends, so the client waits elsewhere.
+        stream = Stream(base, PATH, accept=accept)
+        try:
+            answer["status"] = stream.status
+            answer["raw"] = stream.body()
+        finally:
+            stream.close()
+
+    try:
+        with serving(db, auth, heartbeat_interval=0.05) as (_, base):
+            reader = threading.Thread(target=client, args=(base,))
+            reader.start()
+            try:
+                assert searching.wait(5)
+                fake.revoke()
+                with pytest.raises(VisibilityUnavailable):
+                    auth.code_readable_repositories("session=alice", {"acme/other"})
+                requests = fake.counts()
+            finally:
+                release.set()
+                reader.join(10)
+            # No request was spent on the recheck: auth already knew.
+            assert fake.counts() == requests
+            after = Stream(base, PATH, accept="application/json")
+            try:
+                assert after.status == 401
+            finally:
+                after.close()
+    finally:
+        auth.close()
+        fake.close()
+    raw = answer["raw"]
+    assert b"acme/open" not in raw and b"needle" not in raw
+    if accept == "application/json":
+        assert answer["status"] == 503
+        assert json.loads(raw)["error"] == "visibility_unavailable"
+    else:
+        records = [json.loads(line) for line in raw.splitlines()]
+        assert types(records)[0] == "started"
+        assert "result" not in types(records) and "done" not in types(records)
+        assert records[-1] == {
+            "v": 1, "type": "error", "code": "visibility_unavailable", "status": 503
+        }
 
 
 def test_empty_query_readiness_uses_session_identity_only(tmp_path):

@@ -123,6 +123,77 @@ def test_overstated_total_stays_inside_the_pagination_safety_bound(make):
     assert max(pages) <= 21
 
 
+def test_overstated_total_stops_scheduling_once_an_empty_page_lands(make):
+    # 120 repositories end at page 4 (three populated pages and the empty one). The
+    # advertised ten million used to commit pages 2..21 up front: 21 listing requests.
+    fake, auth = make({"visible": names(120), "total_override": 10_000_000})
+    held = {page: threading.Event() for page in (2, 3, 5, 6, 7, 8, 9)}
+    entered = {page: threading.Event() for page in range(2, 10)}
+    fake.page_gates.update(held)
+    fake.page_entered.update(entered)
+    outcome: dict = {}
+    worker = threading.Thread(
+        target=lambda: outcome.update(value=auth.visible_repositories(COOKIE))
+    )
+    worker.start()
+    try:
+        # The first window (one page per `visibility_concurrency` slot) is on the wire and
+        # only the empty page 4 has answered, ahead of the populated pages 2 and 3.
+        assert all(event.wait(5) for event in entered.values())
+        time.sleep(0.2)
+        for page in (5, 6, 7, 8, 9, 2, 3):
+            held[page].set()
+    finally:
+        for gate in held.values():
+            gate.set()
+        worker.join(10)
+    # An out-of-order empty page ends the scheduling, never the pages before it.
+    assert outcome["value"] == (True, set(names(120)))
+    pages = sorted(
+        int(detail.split()[0].split("=")[1]) for _, kind, detail in fake.events if kind == "list"
+    )
+    assert pages == list(range(1, 10))  # page 1 and one window; pages 10..21 never requested
+
+
+def test_an_empty_page_keeps_a_page_already_on_the_wire_from_hiding_its_failure(make):
+    # Page 4 is empty, but page 2 (needed, still in flight) then fails: the list is not complete.
+    fake, auth = make({"visible": names(120), "total_override": 10_000_000})
+    gate, entered = threading.Event(), threading.Event()
+    fake.page_gates[2] = gate
+    fake.page_entered[4] = entered
+    original = fake.server.RequestHandlerClass.do_GET
+
+    def flaky(handler):
+        if handler.path.endswith("page=2"):
+            gate.wait(5)
+            fake._record("list", "page=2 q=")
+            return handler._send(500)
+        return original(handler)
+
+    fake.server.RequestHandlerClass.do_GET = flaky
+    outcome: dict = {}
+
+    def run():
+        try:
+            outcome["value"] = auth.visible_repositories(COOKIE)
+        except VisibilityUnavailable as error:
+            outcome["error"] = error
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert entered.wait(5)
+        time.sleep(0.2)
+    finally:
+        gate.set()
+        worker.join(10)
+    assert "error" in outcome
+    assert not auth.cache
+    # Page 1, one window, and at most one page issued when the populated page 3 answered
+    # before the empty page 4 did.
+    assert fake.count("list") <= 10
+
+
 def test_more_than_the_safety_bound_still_fails_closed_in_parallel(make):
     _fake, auth = make({"visible": names(1100), "page_delay": 0.01})
     with pytest.raises(VisibilityUnavailable):
@@ -387,9 +458,11 @@ def test_identity_requests_keep_the_app_sub_url_mount(make):
 
 
 def test_overstated_total_cannot_hide_a_logout_seen_on_a_later_page(make):
-    # 120 repositories end at page 4, yet the advertised count makes pages up to 21 be
-    # fetched; a login redirect on a page past the empty one is still an observed logout.
-    _fake, auth = make({"visible": names(120), "total_override": 10_000_000, "logout_from_page": 10})
+    # 120 repositories end at page 4, yet the advertised count puts later pages on the wire
+    # with it; a login redirect on a page past the empty one is still an observed logout.
+    fake, auth = make({"visible": names(120), "total_override": 10_000_000, "logout_from_page": 5})
+    # The empty page answers only once the logout page is in flight, so it is always fetched.
+    fake.page_gates[4] = fake.page_entered[5] = threading.Event()
     assert auth.code_readable_repositories(COOKIE, {"acme/r0001"}) == {"acme/r0001"}
     assert auth._code_cache
     with pytest.raises(VisibilityUnavailable):

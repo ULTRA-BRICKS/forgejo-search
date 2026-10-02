@@ -22,6 +22,10 @@ class FakeAuth:
     def session_authenticated(self, cookie: str):
         return self.visible_repositories(cookie)[0]
 
+    @contextmanager
+    def session_watch(self, cookie: str):
+        yield threading.Event()
+
     def visible_repositories(self, cookie: str, repo=None):
         if cookie == "visibility-error":
             raise VisibilityUnavailable("upstream visibility failed")
@@ -274,6 +278,10 @@ class TwoRepoAuth:
 
     def session_authenticated(self, cookie: str):
         return cookie == "session=alice"
+
+    @contextmanager
+    def session_watch(self, cookie: str):
+        yield threading.Event()
 
     def visible_repositories(self, cookie: str, repo=None):
         if cookie != "session=alice":

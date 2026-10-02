@@ -335,19 +335,36 @@ class SearchServer(ThreadingHTTPServer):
 
     def _search(self, cookie, query, limit, wall_started):
         auth = self.auth
-        try:
-            if not query:
-                # The empty query is only an "am I signed in?" check: identity without
-                # enumerating repositories, and no code probes.
+        if not query:
+            # The empty query is only an "am I signed in?" check: identity without
+            # enumerating repositories, and no code probes.
+            try:
                 if not auth.session_authenticated(cookie):
                     return _UNAUTHENTICATED
-                return {
-                    "query": "",
-                    "mode": "auto",
-                    "results": [],
-                    "coverage": empty_coverage(limit),
-                    "total_ms": round((time.perf_counter() - wall_started) * 1000, 2),
-                }
+            except VisibilityUnavailable as error:
+                return _upstream("visibility_unavailable", error)
+            return {
+                "query": "",
+                "mode": "auto",
+                "results": [],
+                "coverage": empty_coverage(limit),
+                "total_ms": round((time.perf_counter() - wall_started) * 1000, 2),
+            }
+        # Grants are validated when the allow-lists are returned. A logout that any request
+        # of this session observes after that, while this result is still being built, must
+        # stop the publication too; it is already known, so no upstream request is spent.
+        with auth.session_watch(cookie) as revoked:
+            outcome = self._authorized_search(cookie, query, limit, wall_started)
+            if revoked.is_set() and not isinstance(outcome, Failure):
+                return _upstream(
+                    "visibility_unavailable",
+                    VisibilityUnavailable("Forgejo session was revoked during the search"),
+                )
+            return outcome
+
+    def _authorized_search(self, cookie, query, limit, wall_started):
+        auth = self.auth
+        try:
             q = parse_query(query)
             if q.repo:
                 authenticated, allowed = auth.visible_repositories(cookie, repo=q.repo)

@@ -7,6 +7,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import deadline as scope
+
 SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
@@ -100,9 +102,20 @@ class Database:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA busy_timeout=5000")
+        # A request-bound connection aborts its own statement once the request is cancelled
+        # or out of time; index and offline connections (no bound request) are untouched.
+        context = scope.current()
+        if context is not None:
+            connection.set_progress_handler(
+                lambda: context.cancelled or context.remaining() == 0.0, 1000
+            )
         try:
             with connection:
                 yield connection
+        except sqlite3.OperationalError:
+            # An interrupted statement is the request's own deadline or cancellation.
+            scope.checkpoint()
+            raise
         finally:
             connection.close()
 

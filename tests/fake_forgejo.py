@@ -52,6 +52,8 @@ class FakeForgejo:
         self.identity_hold: threading.Event | None = None
         self.identity_entered = threading.Event()
         self.head_entered: dict[str, threading.Event] = {}
+        self.page_gates: dict[int, threading.Event] = {}
+        self.page_entered: dict[int, threading.Event] = {}
         self.active = 0
         self.peak = 0
         outer = self
@@ -92,6 +94,12 @@ class FakeForgejo:
                             hold.wait(5)
                         time.sleep(outer.count_delay)
                     else:
+                        entered = outer.page_entered.get(page)
+                        if entered is not None:
+                            entered.set()
+                        gate = outer.page_gates.get(page)
+                        if gate is not None:
+                            gate.wait(5)
                         time.sleep(outer.page_delay)
                     if not signed_in or (
                         not count_only
@@ -147,8 +155,14 @@ class FakeForgejo:
                 finally:
                     outer._leave()
 
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.server.daemon_threads = True
+        class Server(ThreadingHTTPServer):
+            # The default backlog of 5 is below the service's default listing concurrency
+            # (8): a burst overflows it and the dropped SYN is retransmitted a second later,
+            # which is a property of this double, not of Forgejo.
+            request_queue_size = 128
+            daemon_threads = True
+
+        self.server = Server(("127.0.0.1", 0), Handler)
         self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self._thread.start()
 
@@ -185,7 +199,7 @@ class FakeForgejo:
         self.cookies.discard(cookie)
 
     def close(self):
-        for gate in self.head_gates.values():
+        for gate in (*self.head_gates.values(), *self.page_gates.values()):
             gate.set()
         if self.identity_hold is not None:
             self.identity_hold.set()

@@ -182,6 +182,11 @@ Grants must still be unexpired when the complete allow-list is returned; an expi
 grant aborts the request rather than returning partial results. Observed session
 revocation invalidates outstanding checks even after its negative cache entry
 expires or is evicted, so a delayed successful probe cannot resurrect permission.
+The same holds for a result that is still being built: if any request of the session
+observes the logout before the search stage returns, that response is `503`
+(`visibility_unavailable`) instead of the result, without a further upstream request.
+This is not live freshness: a logout that no request has observed is only noticed when
+the cached grants expire (30 seconds at most), as before.
 Configure `--forgejo` with the full internal base URL including
 Forgejo's AppSubURL (for example `http://127.0.0.1:3000/forgejo`). Login redirects
 must match that mount's login path and either the internal authority or
@@ -201,15 +206,19 @@ falls back to the original behavior when a header or parameter is ignored.
   means anonymous, anything else is `503`. Grants keep the 30 s / 5 s lifetimes measured
   from check start; an identity-only entry never stands in for a repository list.
 - **Visibility listing.** Page 1 reports `X-Total-Count`; the remaining pages plus one
-  page past the end are then fetched in parallel. Every listing request of every session
+  page past the end are then fetched in parallel, in page order and at most
+  `--visibility-concurrency` at a time. Every listing request of every session
   (first page, parallel page or sequential fallback page) takes one of
   `--visibility-concurrency` process-wide slots. The count only schedules requests: the
   allow-list is complete only once an empty page was reached. An understated count
-  continues sequentially, an overstated one stays inside the 21-page bound (more than
-  about 1000 repositories still fails closed), and a missing header or concurrency 1 is
-  the original sequential walk. A login redirect on *any* fetched page, including one
-  past the empty page that ends the list, fails the listing and revokes outstanding checks
-  exactly as before; no partial list is ever cached.
+  continues sequentially. An overstated one stops being followed as soon as a page comes
+  back empty: no further page is issued, so the waste is the pages already issued at that
+  moment (about one window past the end, not zero) instead of the whole 21-page bound.
+  More than about 1000 repositories still fails closed, and a missing header or
+  concurrency 1 is the original sequential walk. Every page before the empty one is still
+  awaited, whatever order the answers arrive in. A login redirect on *any* fetched page,
+  including one past the empty page that ends the list, fails the listing and revokes
+  outstanding checks exactly as before; no partial list is ever cached.
 - **`repo:` scope.** An exact `repo:owner/name` (Forgejo-safe characters only) lists
   `q=<name>` natively: a superset of the named repository, because the keyword is a
   case-insensitive substring match under the same access condition. The service still
@@ -309,7 +318,7 @@ Cancellation stops future work; it does not preempt a blocked call. Documented b
 | Condition and flight waits | End immediately (cancellation wakes them; no polling). |
 | Upstream requests (Forgejo) | Every upstream request has an ABSOLUTE lifetime of twice `--request-timeout` (4 s by default), clamped to the request's remaining deadline: a watchdog shuts the socket down at that instant, which wakes a blocked header or body read, so a peer trickling bytes inside the inactivity timeout cannot retain a worker (a single upstream response is also capped at 4 MiB). Shared code probes and identity checks that are not bound to one request use the same 4 s. **Not covered:** DNS resolution runs in the operating system's resolver (`getaddrinfo`), which Python's socket timeout does NOT bound, so a slow or hung resolver can retain the calling worker slot longer than any budget here (finite admitted capacity bounds the damage, nothing frees it early). The documented bound holds for a plain-HTTP, IP-literal `--forgejo` (the deployed local-Forgejo shape): no DNS, and the TCP connect is bounded by the socket timeout before the watchdog is armed. A TLS (`https`) base is not covered: handshakes are not separately bounded. |
 | Not-yet-started shared probes | Not scheduled after cancellation; a probe in flight is never cancelled for another viewer. |
-| SQLite | Statements are not interrupted (local, indexed). Cancellation is checked between stages. |
+| SQLite | A statement of a request-bound connection is interrupted within about 1000 VM steps of the cancellation or deadline; cancellation is also checked between stages. Index and offline connections are never interrupted. |
 | `git cat-file` | `min(1.25 s, time left)`; killed at its timeout. |
 | `ast-grep` | `min(2 s, time left)`; killed at its timeout. Its stdout is captured in memory (see coverage). |
 | Shutdown | `SIGTERM`/`server_close()` stops accepting, cancels open requests and waits at most 5 s for handlers and workers; stuck socket work is abandoned, not killed. |
