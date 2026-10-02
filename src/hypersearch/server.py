@@ -588,9 +588,18 @@ class SearchHandler(BaseHTTPRequestHandler):
                     next_beat = time.monotonic() + interval
                     stream.write({"v": 1, "type": "heartbeat"})
         except StreamBroken:
+            # The work keeps its admission slot until a worker pops it: a cancelled
+            # concurrent.futures item stays in the executor's queue, so returning the slot
+            # early would let dead items accumulate beyond the admission bound. A popped,
+            # already-cancelled request returns at its first checkpoint.
             return None
         finally:
             unregister()
+        if future.cancelled():
+            # Shutdown cancelled it before a worker started it.
+            if context.reason == "client_disconnected":
+                return None
+            return _DEADLINE if context.reason == DEADLINE_REASON else _UNAVAILABLE
         if future.done():
             return future.result()
         if context.reason == DEADLINE_REASON:

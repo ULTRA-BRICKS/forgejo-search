@@ -12,6 +12,7 @@ import itertools
 import json
 import math
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -19,6 +20,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from contextlib import contextmanager
 from hashlib import sha256
 from typing import NamedTuple
@@ -108,6 +110,62 @@ class VisibilityUnavailable(RuntimeError):
 
 class _BackoffActive(VisibilityUnavailable):
     pass
+
+
+# Absolute monotonic deadline for the upstream request being made by this thread. A socket
+# timeout only limits inactivity between bytes, so a peer trickling headers or body inside
+# it could hold a worker (and a pool slot) indefinitely; the connection below arms a
+# watchdog that shuts the socket down at this instant.
+_socket_deadline: contextvars.ContextVar[tuple[float, list] | None] = contextvars.ContextVar(
+    "hypersearch_socket_deadline", default=None
+)
+
+
+def _shutdown_socket(sock) -> None:
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+class _Watchdog:
+    """Arms a timer that shuts the socket down at the absolute deadline in force at connect.
+
+    urllib closes the connection object as soon as the response headers are parsed, while
+    the body is still to be read from the same socket, so the timer is owned by the
+    request (`ForgejoAuth._open`) and cancelled when the response is closed, not here.
+    """
+
+    def connect(self):
+        armed = _socket_deadline.get()
+        if armed is not None and armed[0] <= time.monotonic():
+            raise TimeoutError("upstream request budget exhausted before connecting")
+        super().connect()
+        if armed is not None:
+            timer = threading.Timer(
+                max(0.0, armed[0] - time.monotonic()), _shutdown_socket, (self.sock,)
+            )
+            timer.daemon = True
+            timer.start()
+            armed[1].append(timer)
+
+
+class _BoundedHTTPConnection(_Watchdog, http.client.HTTPConnection):
+    pass
+
+
+class _BoundedHTTPSConnection(_Watchdog, http.client.HTTPSConnection):
+    pass
+
+
+class _BoundedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_BoundedHTTPConnection, req)
+
+
+class _BoundedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_BoundedHTTPSConnection, req)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -261,6 +319,8 @@ class ForgejoAuth:
         self._opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({}),
             _NoRedirect(),
+            _BoundedHTTPHandler(),
+            _BoundedHTTPSHandler(),
         )
 
     def close(self) -> None:
@@ -329,13 +389,58 @@ class ForgejoAuth:
                 "Accept": "application/json",
             },
         )
-        with self._opener.open(request, timeout=scope.clamp(self.request_timeout)) as response:
-            payload = json.load(response)
+        with self._open(request) as response:
+            payload = json.loads(self._read_body(response))
             total = _advertised_total(response.headers.get("X-Total-Count"))
         if isinstance(payload, dict):
             payload = _Payload(payload)
             payload.total_count = total
         return payload
+
+    @contextmanager
+    def _open(self, request):
+        """Open an upstream request whose WHOLE lifetime (headers and body) is bounded.
+
+        The budget is twice the socket timeout, clamped by the bound request's remaining
+        time; at that instant a watchdog shuts the socket down, which wakes a blocked read.
+        Not covered: DNS resolution (blocking `getaddrinfo`) and the TCP connect, which are
+        bounded only by the socket timeout; use an IP-literal base to avoid DNS.
+        """
+        budget = scope.clamp(2 * self.request_timeout)
+        timers: list = []
+        token = _socket_deadline.set((time.monotonic() + budget, timers))
+        try:
+            try:
+                response = self._opener.open(request, timeout=scope.clamp(self.request_timeout))
+            finally:
+                _socket_deadline.reset(token)
+            with response:
+                yield response
+        finally:
+            for timer in timers:
+                timer.cancel()
+
+    # A visibility page is at most 50 rows (tens of KiB); anything near this is not Forgejo.
+    _MAX_BODY_BYTES = 4 * 1024 * 1024
+
+    def _read_body(self, response) -> bytes:
+        """Read a JSON body within an ABSOLUTE budget (twice the socket timeout) and size cap.
+
+        A socket timeout only limits inactivity between bytes; an upstream trickling one
+        byte per interval would otherwise retain a worker indefinitely. The budget is
+        checked between reads, so a read in progress can overrun it by one socket timeout.
+        """
+        end = time.monotonic() + scope.clamp(2 * self.request_timeout)
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := response.read(65536):
+            size += len(chunk)
+            if size > self._MAX_BODY_BYTES:
+                raise ValueError("Forgejo response exceeded the size cap")
+            chunks.append(chunk)
+            if time.monotonic() >= end:
+                raise TimeoutError("Forgejo response body exceeded its time budget")
+        return b"".join(chunks)
 
     def _head(self, path: str, cookie: str) -> int:
         # HEAD is safe and correctly gated identically to GET for this route:
@@ -354,7 +459,7 @@ class ForgejoAuth:
                 "X-Forwarded-Proto": "https",
             },
         )
-        with self._opener.open(request, timeout=scope.clamp(self.request_timeout)) as response:
+        with self._open(request) as response:
             return int(response.status)
 
     def _remember(
@@ -499,6 +604,11 @@ class ForgejoAuth:
             if error.code in _LOGIN_REQUIRED_STATUSES or (
                 error.code in _LOGIN_REDIRECT_STATUSES and self._redirects_to_login(error)
             ):
+                # Session-wide invalidation happens HERE, where the login response is
+                # seen, so a sibling page that errors cannot keep the grants alive.
+                self._remember(
+                    sha256(cookie.encode()).hexdigest(), False, set(), self.negative_ttl
+                )
                 return None
             raise self._failure(
                 f"Forgejo repository visibility check failed with HTTP {error.code} on page {page}"
@@ -620,9 +730,13 @@ class ForgejoAuth:
                             pause = min(pause, remaining)
                     self._capacity.wait(pause)
             return results
-        except BaseException:
-            for future in pending:
-                future.cancel()
+        except BaseException as error:
+            running = [future for future in pending if not future.cancel()]
+            if isinstance(error, VisibilityUnavailable) and running:
+                # A page already on the wire may carry a login redirect: let it land (it
+                # revokes where it is seen) instead of reporting an unrelated failure first.
+                # Bounded by the socket timeout; skipped for cancellation and deadlines.
+                wait_futures(running, timeout=self.request_timeout)
             raise
         finally:
             if unregister is not None:
@@ -1021,7 +1135,10 @@ class ForgejoAuth:
         """
         left = budget_until - time.monotonic()
         parent = scope.current()
-        budget = scope.RequestContext(max(left, 0.0))
+        budget_left = max(left, 0.0)
+        if parent is not None and parent.remaining() is not None:
+            budget_left = min(budget_left, parent.remaining())
+        budget = scope.RequestContext(budget_left)
         unregister = (
             parent.on_cancel(lambda: budget.cancel(parent.reason)) if parent is not None else None
         )

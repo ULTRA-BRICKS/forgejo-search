@@ -455,3 +455,101 @@ def test_unconfirmed_denials_are_shared_with_an_overlapping_search_of_the_same_s
     second.join(10)
     assert outcomes == [set(), set()]
     assert fake.count("head") == 40  # typing must not re-probe a repository per keystroke
+
+
+def test_a_logout_seen_by_a_prefetched_page_revokes_even_if_a_sibling_page_errors(make):
+    # Page 1 authenticates and advertises many pages; page 2 is a logout, page 3 a server error.
+    fake, auth = make({"visible": names(300), "page_delay": 0.05})
+    assert auth.code_readable_repositories(COOKIE, {"acme/r0001"}) == {"acme/r0001"}
+    assert auth._code_cache
+    fake.logout_from_page = 2
+    original = fake.server.RequestHandlerClass.do_GET
+
+    def flaky(handler):
+        if "page=3" in handler.path:
+            fake._record("list", "page=3 q=")
+            return handler._send(500)
+        return original(handler)
+
+    fake.server.RequestHandlerClass.do_GET = flaky
+    with pytest.raises(VisibilityUnavailable):
+        auth.visible_repositories(COOKIE)
+    assert not auth._code_cache  # the observed logout purged session-wide grants
+    assert fake.count("list") >= 3  # pages 2 and 3 really were fetched in parallel
+
+
+def test_denial_confirmation_respects_the_parents_shorter_deadline(make):
+    from hypersearch.deadline import DeadlineExceeded, RequestContext, bound
+
+    fake, auth = make({"visible": names(1), "readable": [], "count_delay": 1.5})
+    started = time.perf_counter()
+    with bound(RequestContext(0.3)):
+        with pytest.raises(DeadlineExceeded):
+            auth.code_readable_repositories(COOKIE, set(names(1)))
+    assert time.perf_counter() - started < 1.0
+
+
+def _trickling_forgejo(byte_interval, total_bytes, *, trickle_headers=False):
+    """Upstream that trickles one byte at a time: the body (200 at once) or the header block."""
+    import socketserver
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            body = b'{"ok":true,"data":[' + b" " * total_bytes + b"]}"
+            head = (
+                b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            )
+            try:
+                if trickle_headers:
+                    for index in range(len(head)):
+                        self.request.sendall(head[index : index + 1])
+                        time.sleep(byte_interval)
+                    self.request.sendall(body)
+                else:
+                    self.request.sendall(head)
+                    for index in range(len(body)):
+                        self.request.sendall(body[index : index + 1])
+                        time.sleep(byte_interval)
+            except OSError:
+                pass
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("trickle_headers", [False, True])
+def test_an_upstream_trickling_bytes_cannot_outlast_the_absolute_request_budget(trickle_headers):
+    # Every byte arrives well inside the 0.5 s socket timeout, so inactivity never fires; only
+    # the absolute budget (2 x request_timeout = 1 s) ends it. Unbounded it would run ~10 s.
+    upstream = _trickling_forgejo(0.1, 100, trickle_headers=trickle_headers)
+    auth = ForgejoAuth(f"http://127.0.0.1:{upstream.server_address[1]}", request_timeout=0.5)
+    try:
+        started = time.perf_counter()
+        with pytest.raises(VisibilityUnavailable):
+            auth.visible_repositories(COOKIE)
+        assert time.perf_counter() - started < 1.8
+    finally:
+        auth.close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_a_bound_request_deadline_also_bounds_the_upstream_socket_lifetime():
+    from hypersearch.deadline import DeadlineExceeded, RequestContext, bound
+
+    upstream = _trickling_forgejo(0.02, 60)
+    auth = ForgejoAuth(f"http://127.0.0.1:{upstream.server_address[1]}", request_timeout=2.0)
+    try:
+        started = time.perf_counter()
+        with bound(RequestContext(0.3)):
+            with pytest.raises(DeadlineExceeded):
+                auth.visible_repositories(COOKIE)
+        assert time.perf_counter() - started < 0.8  # not the 2 s socket timeout, nor 1.2 s of body
+    finally:
+        auth.close()
+        upstream.shutdown()
+        upstream.server_close()

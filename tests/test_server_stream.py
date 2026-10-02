@@ -805,3 +805,73 @@ def test_owner_and_path_wildcards_keep_sql_like_semantics_after_narrowing(tmp_pa
     # neither a different length (acmeZ) nor another owner.
     assert {hit["repo"] for hit in payload["results"]} == {"acme_x/open", "acmeQx/open"}
     assert fake.count("scoped") == 0  # owner: has no safe native narrowing
+
+
+def test_disconnected_queued_searches_keep_the_admission_bound_until_a_worker_pops_them(database):
+    # A cancelled concurrent.futures item stays in the executor queue, so its admission
+    # slot is returned when a worker pops it (instantly, as it is already cancelled) --
+    # never earlier, or dead items could pile up beyond the admission bound.
+    auth = ScriptedAuth(block=True, wait=3.0)
+    with serving(database, auth, search_workers=1, search_queue=3, heartbeat_interval=0.05) as (
+        instance,
+        _,
+    ):
+        port = instance.server_port
+        request = (
+            b"GET /api/hypersearch?q=needle HTTP/1.0\r\nCookie: session=alice\r\n"
+            b"Accept: application/x-ndjson\r\n\r\n"
+        )
+        running = socket.create_connection(("127.0.0.1", port))
+        running.sendall(request)
+        assert auth.entered.wait(2)
+        queued = [socket.create_connection(("127.0.0.1", port)) for _ in range(3)]
+        for sock in queued:
+            sock.sendall(request)
+        end = time.monotonic() + 2
+        while instance._outstanding < 4 and time.monotonic() < end:
+            time.sleep(0.02)
+        assert instance._outstanding == 4
+        for sock in queued:
+            sock.close()
+        time.sleep(0.4)
+        assert instance._outstanding == 4  # still bounded: nothing was dropped from the queue
+        auth.release.set()
+        end = time.monotonic() + 3
+        while instance._outstanding and time.monotonic() < end:
+            time.sleep(0.02)
+        running.close()
+        assert instance._outstanding == 0  # popped dead items returned their slots at once
+        assert auth.calls == 1  # and the disconnected searches never reached the upstream
+
+
+def test_a_queued_request_cancelled_by_shutdown_still_gets_a_terminal_error(database):
+    auth = ScriptedAuth(block=True, wait=3.0)
+    with serving(
+        database, auth, search_workers=1, search_queue=2, heartbeat_interval=0.05, shutdown_grace=0.2
+    ) as (instance, _):
+        port = instance.server_port
+        request = (
+            b"GET /api/hypersearch?q=needle HTTP/1.0\r\nCookie: session=alice\r\n"
+            b"Accept: application/x-ndjson\r\n\r\n"
+        )
+        first = socket.create_connection(("127.0.0.1", port))
+        first.sendall(request)
+        assert auth.entered.wait(2)
+        queued = socket.create_connection(("127.0.0.1", port), timeout=5)
+        queued.sendall(request)
+        end = time.monotonic() + 2
+        while instance._outstanding < 2 and time.monotonic() < end:
+            time.sleep(0.02)
+        instance.shutdown()
+        instance.server_close()
+        answer = bytearray()
+        try:
+            while chunk := queued.recv(65536):
+                answer.extend(chunk)
+        except OSError:
+            pass
+        first.close()
+        queued.close()
+    lines = [json.loads(line) for line in bytes(answer).partition(b"\r\n\r\n")[2].splitlines() if line]
+    assert lines[0] == {"v": 1, "type": "started"}
+    assert lines[-1] == {"v": 1, "type": "error", "code": "search_unavailable", "status": 503}
