@@ -1,0 +1,7 @@
+version: 1
+task:
+  backend: forgejo
+  forgejo:
+    url: https://git.hyperide.ai
+    repo: ultrabricks/forgejo-search
+    attachment_mode: native
