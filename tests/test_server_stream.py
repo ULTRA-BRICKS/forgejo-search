@@ -876,3 +876,30 @@ def test_a_queued_request_cancelled_by_shutdown_still_gets_a_terminal_error(data
     lines = [json.loads(line) for line in bytes(answer).partition(b"\r\n\r\n")[2].splitlines() if line]
     assert lines[0] == {"v": 1, "type": "started"}
     assert lines[-1] == {"v": 1, "type": "error", "code": "search_unavailable", "status": 503}
+
+
+def test_a_future_cancelled_between_the_check_and_the_result_is_a_terminal_error():
+    from concurrent.futures import CancelledError
+    from types import SimpleNamespace
+
+    from hypersearch.deadline import RequestContext
+    from hypersearch.server import SearchHandler, ServerSettings
+
+    class RacingFuture:
+        """Pending when `cancelled()` is asked, cancelled by shutdown before `result()`."""
+
+        def cancelled(self):
+            return False
+
+        def done(self):
+            return True
+
+        def add_done_callback(self, callback):
+            callback(self)
+
+        def result(self):
+            raise CancelledError
+
+    handler = SimpleNamespace(server=SimpleNamespace(settings=ServerSettings()))
+    outcome = SearchHandler._wait(handler, RacingFuture(), RequestContext(5), None)
+    assert outcome.code == "search_unavailable" and outcome.status == 503

@@ -20,7 +20,6 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import wait as wait_futures
 from contextlib import contextmanager
 from hashlib import sha256
 from typing import NamedTuple
@@ -440,6 +439,11 @@ class ForgejoAuth:
             chunks.append(chunk)
             if time.monotonic() >= end:
                 raise TimeoutError("Forgejo response body exceeded its time budget")
+        if response.length:
+            # read(amt) stops silently at an early EOF; json.load's read() raised here. A body
+            # cut short of its declared Content-Length is not a complete answer even when the
+            # prefix happens to be valid JSON (an empty list would read as "sees nothing").
+            raise http.client.IncompleteRead(b"".join(chunks), response.length)
         return b"".join(chunks)
 
     def _head(self, path: str, cookie: str) -> int:
@@ -736,11 +740,27 @@ class ForgejoAuth:
                 # A page already on the wire may carry a login redirect: let it land (it
                 # revokes where it is seen) instead of reporting an unrelated failure first.
                 # Bounded by the socket timeout; skipped for cancellation and deadlines.
-                wait_futures(running, timeout=self.request_timeout)
+                self._drain(running)
             raise
         finally:
             if unregister is not None:
                 unregister()
+
+    def _drain(self, running: list[Future]) -> None:
+        """Wait for pages already on the wire, woken by their completion (a done-callback
+        already notifies `_capacity`) and by the caller's cancellation; never past the socket
+        timeout or the request deadline."""
+        context = scope.current()
+        end = time.monotonic() + self.request_timeout
+        with self._capacity:
+            while any(not future.done() for future in running):
+                if context is not None and (context.cancelled or context.remaining() == 0.0):
+                    return
+                pause = end - time.monotonic()
+                if pause <= 0:
+                    return
+                left = None if context is None else context.remaining()
+                self._capacity.wait(pause if left is None else min(pause, left))
 
     def _identity_check(self, cookie: str, *, after: int | None) -> bool:
         """Is this session signed in, according to a request issued after `after`?

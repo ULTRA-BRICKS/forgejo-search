@@ -28,7 +28,7 @@ import socket
 import threading
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -606,7 +606,11 @@ class SearchHandler(BaseHTTPRequestHandler):
                 return None
             return _DEADLINE if context.reason == DEADLINE_REASON else _UNAVAILABLE
         if future.done():
-            return future.result()
+            try:
+                return future.result()
+            except CancelledError:
+                # Shutdown cancelled it between the check above and now.
+                return _DEADLINE if context.reason == DEADLINE_REASON else _UNAVAILABLE
         if context.reason == DEADLINE_REASON:
             return _DEADLINE
         if context.reason == "client_disconnected":

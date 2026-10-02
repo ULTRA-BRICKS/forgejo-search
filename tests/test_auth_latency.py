@@ -549,3 +549,66 @@ def test_a_bound_request_deadline_also_bounds_the_upstream_socket_lifetime():
         auth.close()
         upstream.shutdown()
         upstream.server_close()
+
+
+def _short_body_forgejo(declared, body):
+    """Upstream that declares more bytes than it sends, then closes the connection."""
+    import socketserver
+
+    class Handler(socketserver.BaseRequestHandler):
+        def handle(self):
+            self.request.recv(65536)
+            self.request.sendall(
+                b"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n"
+                + f"Content-Length: {declared}\r\n\r\n".encode()
+                + body
+            )
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+@pytest.mark.parametrize("path", ["listing", "identity"])
+def test_a_body_shorter_than_its_declared_length_is_never_a_complete_answer(path):
+    # `{"ok":true,"data":[]}` is itself valid JSON, so a parse alone cannot tell a cut-off
+    # body from a complete empty list: HTTP framing must reject it.
+    upstream = _short_body_forgejo(1000, b'{"ok":true,"data":[]}')
+    auth = ForgejoAuth(f"http://127.0.0.1:{upstream.server_address[1]}", request_timeout=1.0)
+    try:
+        with pytest.raises(VisibilityUnavailable):
+            if path == "listing":
+                auth.visible_repositories(COOKIE)
+            else:
+                auth.session_authenticated(COOKIE)
+        assert not auth.cache
+    finally:
+        auth.close()
+        upstream.shutdown()
+        upstream.server_close()
+
+
+def test_sibling_page_drain_wakes_on_cancellation_instead_of_waiting_out_the_socket_timeout(make):
+    from hypersearch.deadline import RequestContext, bound
+
+    fake, auth = make({"visible": names(300)}, request_timeout=1.5)
+    original = fake.server.RequestHandlerClass.do_GET
+
+    def staged(handler):
+        if "page=3" in handler.path:
+            return handler._send(500)  # fails at once
+        if "page=2" in handler.path:
+            time.sleep(1.2)  # still on the wire when page 3 has already failed
+        return original(handler)
+
+    fake.server.RequestHandlerClass.do_GET = staged
+    # No deadline here: only the cancellation can end the drain, so neither the request
+    # budget nor the upstream socket watchdog (3 s) can explain an early return.
+    context = RequestContext(30)
+    threading.Timer(0.3, lambda: context.cancel("client_disconnected")).start()
+    started = time.perf_counter()
+    with bound(context), pytest.raises(Exception) as raised:
+        auth.visible_repositories(COOKIE)
+    assert time.perf_counter() - started < 0.8  # the old fixed wait ran ~1.2 s
+    assert type(raised.value).__name__ in {"RequestCancelled", "VisibilityUnavailable"}
