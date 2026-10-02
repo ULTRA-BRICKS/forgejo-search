@@ -120,7 +120,9 @@ paths, repository totals, denied-code counts and index identifiers are not part
 of coverage.
 Duplicate AST records can require decoding until a unique sentinel, exhaustion,
 or the shared timeout. There is no separate raw-record/byte cap: subprocess output
-is still captured in memory. Coverage does not claim a streaming memory bound.
+is still captured in memory for at most the engine budget (two seconds, or less when
+the request deadline is nearer). The streaming transport's record caps bound what the
+service sends, not what ast-grep emits; coverage does not claim a streaming memory bound.
 
 Consumers should feature-detect version 1, display bounded scope and lexical/
 pattern-based semantics, distinguish empty results from AST unavailability, and
@@ -152,10 +154,15 @@ chain, including `reqRepoCodeReader`, without transferring the response body.
 There is **no GET fallback** for a rejected HEAD: `405`/`501` and other ambiguous
 statuses fail closed with `503`. The separate `/repo/search` visibility and identity
 requests use GET and parse JSON; they are not a fallback code-permission probe.
-A `404` is only cached as a code denial after an uncached
-`/repo/search` identity check: a revoked session can also receive a bare `404`
-on a private repository. A login response invalidates that session's cached
-code grants and fails the current request closed. Any ambiguous failure
+A `404` is only cached as a code denial after an identity check -- `GET /repo/search`
+with `count_only=true`, which passes the same sign-in gate as the listing -- that was
+*issued after that 404 was received*: a revoked session can also receive a bare `404`
+on a private repository. A call confirms all of its `404`s with one such check, issued
+after the newest of them; concurrent calls of one session share a check only if it was
+issued later than the denial it confirms (ordered by an internal sequence number, not
+wall-clock reads), otherwise the earlier check is waited out and a new one is issued.
+A login response invalidates that session's cached code grants and fails the current
+request closed. Any ambiguous failure
 (timeout, `403`, malformed identity response, ...) returns `503`, with five-second
 per-session code-probe backoff rather than a cached normal deny.
 This narrower "code-allowed" scope gates file/symbol/AST/text results;
@@ -180,6 +187,77 @@ Forgejo's AppSubURL (for example `http://127.0.0.1:3000/forgejo`). Login redirec
 must match that mount's login path and either the internal authority or
 `--public-host`; redirects are never followed with the viewer's cookie.
 
+## Avoidable upstream work
+
+Designed against the pinned Forgejo 16.0.5 `GET /repo/search` source (`limit` capped at
+50, alphabetical order, `X-Total-Count` header, `count_only` answering `{"ok":true}`,
+`q` = case-insensitive name/topic substring under the same access condition). The
+previous production release 16.0.3 is not in the inspected archive, so every shortcut
+falls back to the original behavior when a header or parameter is ignored.
+
+- **Session readiness.** An empty query (the header's "signed in?" probe) and denial
+  confirmations send `GET /repo/search?limit=1&page=1&count_only=true` instead of the
+  full listing. `{"ok":true}` or a one-row listing means signed in, a login redirect
+  means anonymous, anything else is `503`. Grants keep the 30 s / 5 s lifetimes measured
+  from check start; an identity-only entry never stands in for a repository list.
+- **Visibility listing.** Page 1 reports `X-Total-Count`; the remaining pages plus one
+  page past the end are then fetched in parallel. Every listing request of every session
+  (first page, parallel page or sequential fallback page) takes one of
+  `--visibility-concurrency` process-wide slots. The count only schedules requests: the
+  allow-list is complete only once an empty page was reached. An understated count
+  continues sequentially, an overstated one stays inside the 21-page bound (more than
+  about 1000 repositories still fails closed), and a missing header or concurrency 1 is
+  the original sequential walk. A login redirect on *any* fetched page, including one
+  past the empty page that ends the list, fails the listing and revokes outstanding checks
+  exactly as before; no partial list is ever cached.
+- **`repo:` scope.** An exact `repo:owner/name` (Forgejo-safe characters only) lists
+  `q=<name>` natively: a superset of the named repository, because the keyword is a
+  case-insensitive substring match under the same access condition. The service still
+  applies its own case-insensitive candidate filter and the case-sensitive SQL equality,
+  so ranking, coverage and permissions are unchanged. `owner:` and `path:` keep SQL
+  `LIKE` wildcard semantics (`%`, `_`) and have no safe native equivalent; they and
+  unsafe `repo:` values use the full listing. A fresh full allow-list answers a scoped
+  request without any network call, and scoped lists are discarded on observed logout.
+- **Same-session coalescing.** Overlapping listings, readiness checks and probes of a
+  session share one in-flight request. Followers wait in their own thread (never on a
+  shared worker), a cancelled leader hands the work to a waiting follower, and shared
+  probes are never cancelled while another viewer still needs them.
+
+## Streaming transport (NDJSON v1)
+
+A client opts in with an explicit `Accept: application/x-ndjson` (weight above zero;
+`q=0`, `*/*` and `application/json` stay on JSON). The response is `200` with
+`Content-Type: application/x-ndjson; charset=utf-8`, `Cache-Control: no-store, private,
+no-transform`, `X-Accel-Buffering: no`, no `Content-Length` and a closing connection
+(HTTP/1.0 close-delimited framing; no invented chunks), then one compact UTF-8 JSON
+object per `\n`-terminated line (U+2028/2029 are escaped):
+
+1. `{"v":1,"type":"started"}` flushed before any upstream call;
+2. `{"v":1,"type":"heartbeat"}` every `--heartbeat-interval` (default 2 s) while work
+   blocks -- no names, counts, stage, scope or cache state;
+3. exactly one `{"v":1,"type":"result","data":<the full existing JSON response>}`;
+4. `{"v":1,"type":"done"}`.
+
+A failure after the headers is one terminal `{"v":1,"type":"error","code":...,"status":...}`
+with no `done`: `authentication_required` (401), `visibility_unavailable` and
+`code_visibility_unavailable` (503), `search_unavailable` (503, also for unexpected
+errors and oversized results; raw exceptions are never forwarded), `deadline_exceeded`
+(504), `server_busy` (503). Authorized data appears only inside the final `result`.
+Records follow the shared caps: 2 MiB each, 8 MiB and 256 records per response; an
+oversized result becomes `search_unavailable`, never a truncation.
+
+Ordinary JSON errors are still returned *before* a stream opens: missing cookie `401`,
+`400 query_too_long` (over 2048 characters), `400/414/431` for malformed or oversized
+requests, `404`, and `503 server_busy` with `Retry-After: 1` when every worker and queue
+slot is taken. JSON clients additionally see `504 {"error":"deadline_exceeded"}` past the
+overall deadline and `503 {"error":"search_unavailable"}` for unexpected failures (the
+connection used to be dropped); their success bodies and other statuses are unchanged.
+
+Behind a proxy: disable response buffering and compression for this location (nginx
+`proxy_buffering off; gzip off;`; the `X-Accel-Buffering: no` header already covers
+buffering). The deployed 15 s read timeout is satisfied by the 2 s heartbeat; this service
+does not change proxy configuration.
+
 ## Probe capacity
 
 `hypersearch serve` accepts these flags (flags override environment variables):
@@ -190,44 +268,81 @@ must match that mount's login path and either the internal authority or
 | `--code-probe-concurrency` | `HYPERSEARCH_CODE_PROBE_CONCURRENCY` | 8 | integer 1–64 |
 | `--request-timeout` | `HYPERSEARCH_REQUEST_TIMEOUT` | 2 seconds | finite, >0 through 120 |
 | `--code-cache-max-entries` | `HYPERSEARCH_CODE_CACHE_MAX_ENTRIES` | 8192 | integer 1–1000000 |
+| `--visibility-concurrency` | `HYPERSEARCH_VISIBILITY_CONCURRENCY` | 8 | integer 1–64 (1 = sequential listing) |
+| `--request-deadline` | `HYPERSEARCH_REQUEST_DEADLINE` | 20 seconds | finite, >0 through 300 |
+| `--heartbeat-interval` | `HYPERSEARCH_HEARTBEAT_INTERVAL` | 2 seconds | finite, 0.05 through 30 |
+| `--search-workers` | `HYPERSEARCH_SEARCH_WORKERS` | 8 | integer 1–64 |
+| `--search-queue` | `HYPERSEARCH_SEARCH_QUEUE` | 24 | integer 0–256 |
+| `--max-connections` | `HYPERSEARCH_MAX_CONNECTIONS` | 64 | integer 1–1024 |
 
-The code-probe deadline includes waiting for capacity, but not the earlier
-repository-visibility pagination or search execution. Workers and admitted probes
-are bounded across all sessions in one service process, not multiplied per query.
-A deadline or upstream failure returns no partial result. Running probes may finish
-after the caller's deadline; they retain their shared slots until completion.
+`--request-deadline` divided by `--heartbeat-interval` must leave room for the 256-record
+stream cap (the CLI exits with status 2 otherwise). Invalid values exit before the
+database is opened or the port is bound.
+
+The code-probe budget covers only the wait for code-reader probes. One monotonic
+request deadline spans admission, identity, listing, probes, search and output.
+Workers and admitted probes are bounded across all sessions in one service process, not
+multiplied per query. A deadline or upstream failure returns no partial result.
 Overlapping checks for the same session/repository share one future before worker
-admission. Released capacity wakes pending requests even while their other probes
-are still running.
-The request timeout is a socket timeout, not a hard whole-response deadline.
+admission; released capacity wakes pending requests even while their other probes are
+still running. The request timeout is a socket inactivity timeout; each upstream request additionally has the absolute lifetime described under "Cancellation and resource bounds".
 Multiple service processes each have their own pool and caches.
 The caller owns `ForgejoAuth` and must call its idempotent `close()` after stopping
-HTTP requests; the CLI does so when its serve loop exits. Shutdown joins admitted
-probes rather than abandoning their worker threads.
-The deployment's nginx 15-second timeout is not an end-to-end authorization guarantee:
-cold visibility pagination precedes the code-probe budget, and socket timeouts do not
-cap total response duration. Release acceptance must measure the full authenticated
-request, not label the code-probe budget as its end-to-end deadline.
+HTTP requests; the CLI does so when its serve loop exits (also on `SIGTERM`). Shutdown
+joins admitted probes and listing workers rather than abandoning their threads.
 
 Cold unscoped searches still probe **every visible, indexed repository**, not just
-repositories with text matches. `repo:` and `owner:` narrow candidates before probing;
-path/language terms do not. Empty queries skip code probes. Warm entries avoid HTTP
-requests until expiry or eviction. Each cold `404` adds an identity recheck.
-Increase capacity only with measured upstream headroom; never bypass code permission
-checks or lengthen permission TTLs to hide overload.
+repositories with text matches. A `repo:` qualifier narrows candidates (and the native
+listing); `owner:` narrows candidates only; path/language terms do not. Empty queries skip
+code probes. Warm entries avoid HTTP requests until expiry or eviction. Increase capacity
+only with measured upstream headroom; never bypass code permission checks or lengthen
+permission TTLs to hide overload.
 
-The source package version is 0.3.0 for additive viewer-visible coverage. Deployment
-still identifies the runtime by its full vendored source revision, not package
-metadata: the infrastructure owner must update both REVISION and VERSION when
-integrating this source. A source pull request does not update the running service.
+## Cancellation and resource bounds
 
-A synthetic localhost HTTP workload with 600 indexed/visible repositories and
-150 ms per HEAD measured: default 8 workers/10 seconds failed closed at 10.04 seconds;
-five subsequent keystrokes returned backed-off `503` in 1.4–2.3 ms with zero new HEADs.
-8 workers/20 seconds completed in 11.80 seconds; 16 workers/10 seconds in 5.99 seconds.
-Warm searches took 5.6–6.7 ms with zero HEADs; a cold single-repository query took
-166 ms with one HEAD. These are fixture measurements, not production guarantees.
-Expiry, eviction, other sessions and identity rechecks can make later searches cold.
+Cancellation stops future work; it does not preempt a blocked call. Documented bounds:
+
+| Resource | Bound after the request is cancelled or out of time |
+| --- | --- |
+| Handler thread / client | Answers at the deadline (`504` / terminal `error`); output writes may overrun the deadline by at most 0.5 s, and one write by at most 5 s otherwise. A vanished NDJSON reader is detected by a failed heartbeat write (at most `--heartbeat-interval` plus the write budget). A JSON client that disconnects is noticed only when the response is written: its search runs to completion or to the request deadline, because read-side EOF is a legal TCP half-close and is not treated as a disconnect. A rejected request is drained for at most 0.5 s in total. |
+| Worker slot and admission | Held until the work itself ends, never released early: the blocked call below finishes, the next checkpoint raises. Total outstanding work is `--search-workers + --search-queue`. |
+| Condition and flight waits | End immediately (cancellation wakes them; no polling). |
+| Upstream requests (Forgejo) | Every upstream request has an ABSOLUTE lifetime of twice `--request-timeout` (4 s by default), clamped to the request's remaining deadline: a watchdog shuts the socket down at that instant, which wakes a blocked header or body read, so a peer trickling bytes inside the inactivity timeout cannot retain a worker (a single upstream response is also capped at 4 MiB). Shared code probes and identity checks that are not bound to one request use the same 4 s. **Not covered:** DNS resolution and the TCP connect, which are bounded only by the socket timeout (use an IP-literal `--forgejo` to avoid DNS). |
+| Not-yet-started shared probes | Not scheduled after cancellation; a probe in flight is never cancelled for another viewer. |
+| SQLite | Statements are not interrupted (local, indexed). Cancellation is checked between stages. |
+| `git cat-file` | `min(1.25 s, time left)`; killed at its timeout. |
+| `ast-grep` | `min(2 s, time left)`; killed at its timeout. Its stdout is captured in memory (see coverage). |
+| Shutdown | `SIGTERM`/`server_close()` stops accepting, cancels open requests and waits at most 5 s for handlers and workers; stuck socket work is abandoned, not killed. |
+| Queues | The work pool is bounded by admission; a queued search whose client disconnects, or that the deadline or shutdown reaches before it starts, is cancelled and returns its slot at once; the listing pool and every listing request are bounded by `--visibility-concurrency`; the probe pool by `--code-probe-concurrency`. Connections beyond `--max-connections` get an immediate `503 server_busy`. |
+| Slow request headers | **Not bounded by elapsed time.** Reading a request line or header is cut after `client_timeout` (10 s) of *inactivity*, so a client that trickles one byte every few seconds can hold a connection slot (and, at `--max-connections`, make others see `503 server_busy`) until it stops. The request deadline starts after the headers are parsed. Terminate slow-header clients at the reverse proxy (nginx `client_header_timeout`). |
+
+The package version is 0.4.0 (additive: opt-in streaming, new serve flags, `repo=` hint
+and `session_authenticated()` on `ForgejoAuth`). Deployment still identifies the runtime by
+its full vendored source revision, not package metadata: the infrastructure owner must
+update both REVISION and VERSION when integrating this source. A source pull request does
+not update the running service.
+
+## Measurements
+
+`benchmarks/search_latency.py` runs the real server and `ForgejoAuth` against a synthetic
+loopback Forgejo with per-request counters (no credentials, no production data). Fixture
+timings, not production guarantees. Cold JSON wall time and upstream requests, before
+(0.3.0) and after (0.4.0); the recorded case is 750 visible repositories, 26 indexed, one
+real second per listing request and 5 ms per probe; the others use 50 ms per listing page,
+20 ms per probe and 50 ms per identity request:
+
+| Workload | 0.3.0 | 0.4.0 |
+| --- | --- | --- |
+| 16 pages × 1 s, unscoped | 16.16 s, 16 listing + 26 probes | 3.07 s, 16 listing + 26 probes |
+| 16 pages × 1 s, `repo:` | 16.12 s, 16 listing + 1 probe | 2.03 s, 2 keyword pages + 1 probe |
+| 16 pages × 1 s, empty query | 16.10 s, 16 listing | 0.05 s, 1 identity request |
+| 600 repositories, unscoped / `repo:` / empty | 2.80 / 0.77 / 0.76 s | 2.20 / 0.15 / 0.06 s |
+| 1000 repositories, unscoped / `repo:` / empty | 4.61 / 1.23 / 1.23 s | 3.64 / 0.14 / 0.06 s |
+| 600 repositories, 300 denied | 4.94 s, 313 listing | 2.27 s, 13 listing + 1 identity |
+
+Warm searches stay at 2–8 ms with zero upstream requests. A 750-repository search with
+6 s listing pages took 18.08 s end to end as a stream: first byte after 1 ms, nine
+heartbeats about every 2 s, then `result` and `done`.
 
 ## Development
 
