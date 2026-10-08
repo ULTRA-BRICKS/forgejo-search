@@ -972,6 +972,11 @@ def test_a_future_cancelled_between_the_check_and_the_result_is_a_terminal_error
         def result(self):
             raise CancelledError
 
-    handler = SimpleNamespace(server=SimpleNamespace(settings=ServerSettings()))
-    outcome = SearchHandler._wait(handler, RacingFuture(), RequestContext(5), None)
+    handler = object.__new__(SearchHandler)
+    handler.server = SimpleNamespace(settings=ServerSettings())
+    handler._context = RequestContext(5)
+    connection, peer = socket.socketpair()
+    with connection, peer:
+        handler.connection = connection
+        outcome = handler._wait(RacingFuture(), handler._context, None)
     assert outcome.code == "search_unavailable" and outcome.status == 503

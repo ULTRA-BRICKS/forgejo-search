@@ -21,6 +21,7 @@ Resource model (all configurable through `ServerSettings`):
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import math
@@ -54,6 +55,25 @@ MAX_RECORDS = 256
 RESERVED_RECORDS = 4
 MAX_QUERY_CHARS = 2048
 WRITE_TIMEOUT = 5.0
+# A successful write may be followed by an asynchronous TCP reset. Observe the
+# confirmed error without waiting another heartbeat; EOF alone is not an error.
+# Bound idle wakeups while retaining margin after the default two-second heartbeat.
+DISCONNECT_CHECK_INTERVAL = 0.25
+# SO_ERROR can also contain recoverable ICMP errors on an established TCP socket.
+# Only a terminated connection or an invalid socket proves work has no reader.
+_DISCONNECT_ERRORS = frozenset(
+    {
+        errno.EBADF,
+        errno.ENOTSOCK,
+        errno.ENOTCONN,
+        errno.ECONNABORTED,
+        errno.ECONNRESET,
+        errno.ENETRESET,
+        errno.EPIPE,
+        errno.ESHUTDOWN,
+        errno.ETIMEDOUT,
+    }
+)
 # Output may outlive the request deadline by this much, never by the full write budget.
 OUTPUT_GRACE = 0.5
 # Total (not per-read) time spent draining a rejected request before the connection closes.
@@ -580,12 +600,38 @@ class SearchHandler(BaseHTTPRequestHandler):
         self.connection.settimeout(self._write_budget())
         self.connection.sendall(payload)
 
+    def _client_disconnected(self) -> bool:
+        try:
+            error = self.connection.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            failed = error in _DISCONNECT_ERRORS
+            if not failed:
+                # Winsock can leave SO_ERROR at zero and surface a reset only on
+                # recv/send. Peek without blocking or consuming request bytes.
+                # Avoid select(): valid fd numbers can exceed its FD_SETSIZE.
+                timeout = self.connection.gettimeout()
+                try:
+                    self.connection.setblocking(False)
+                    self.connection.recv(1, socket.MSG_PEEK)
+                    # b"" is a legal write-half-close, not proof the reader left.
+                except BlockingIOError:
+                    pass  # No bytes or confirmed transport error are available.
+                finally:
+                    self.connection.settimeout(timeout)
+        except OSError as error:
+            failed = error.errno in _DISCONNECT_ERRORS
+        if failed:
+            # SO_ERROR reads clear the pending error. Preserve confirmed disconnects
+            # immediately; transient route errors do not cancel a live connection.
+            self._context.cancel("client_disconnected")
+        return failed
+
     def _wait(self, future, context, stream):
         """Block until the work ends, beating heartbeats while it runs.
 
         Returns the work's outcome, a deadline/shutdown `Failure`, or None when the client
-        is gone. A vanished client is detected by a failed heartbeat write: read-side EOF
-        alone is a legal half-close, so it is not treated as a disconnect. The handler may
+        is gone. A vanished client is detected by a confirmed socket error or a failed
+        heartbeat write: read-side EOF alone is a legal half-close, not a disconnect.
+        The handler may
         return before the work does: the work keeps its slot until it observes the
         cancellation.
         """
@@ -596,16 +642,20 @@ class SearchHandler(BaseHTTPRequestHandler):
         next_beat = time.monotonic() + interval
         try:
             while not wake.is_set():
-                # Only a stream beats; a JSON response sleeps until done, deadline or cancel.
-                pause = None if stream is None else next_beat - time.monotonic()
+                # JSON has no heartbeat, but can still observe a confirmed socket reset.
+                pause = DISCONNECT_CHECK_INTERVAL
+                if stream is not None:
+                    pause = min(pause, interval / 2, next_beat - time.monotonic())
                 remaining = context.remaining()
                 if remaining is not None:
-                    pause = remaining if pause is None else min(pause, remaining)
-                if wake.wait(None if pause is None else max(0.0, pause)):
+                    pause = min(pause, remaining)
+                if wake.wait(max(0.0, pause)):
                     break
                 if context.remaining() == 0.0:
                     context.cancel(DEADLINE_REASON)
                     break
+                if self._client_disconnected():
+                    return None
                 if stream is not None and time.monotonic() >= next_beat:
                     next_beat = time.monotonic() + interval
                     stream.write({"v": 1, "type": "heartbeat"})
@@ -617,10 +667,14 @@ class SearchHandler(BaseHTTPRequestHandler):
             return None
         finally:
             unregister()
+        # Completion and an asynchronous reset can wake together. Do not return a
+        # publishable result after observing the reset, even if the future is done.
+        if context.reason == "client_disconnected" or (
+            not context.cancelled and self._client_disconnected()
+        ):
+            return None
         if future.cancelled():
             # Shutdown cancelled it before a worker started it.
-            if context.reason == "client_disconnected":
-                return None
             return _DEADLINE if context.reason == DEADLINE_REASON else _UNAVAILABLE
         if future.done():
             try:
