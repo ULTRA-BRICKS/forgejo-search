@@ -18,6 +18,7 @@ from itertools import islice
 from pathlib import Path
 from urllib.parse import quote
 
+from . import deadline as scope
 from .db import Database
 from .query import (
     SearchQuery,
@@ -564,7 +565,7 @@ def _candidate_blob_texts(rows: list[sqlite3.Row]) -> dict[tuple[str, str], str]
         if oid not in oids:
             oids.append(oid)
 
-    deadline = time.monotonic() + 1.25
+    deadline = time.monotonic() + scope.clamp(1.25)
     decoded: dict[tuple[str, str], str] = {}
     for repo_path, oids in groups.items():
         remaining = deadline - time.monotonic()
@@ -635,7 +636,8 @@ def _run_ast(
     limit: int,
     ast_grep: str,
 ) -> tuple[list[SearchHit], str]:
-    deadline = time.monotonic() + 2
+    budget = scope.clamp(2)
+    deadline = time.monotonic() + budget
     try:
         process = subprocess.run(
             [
@@ -651,10 +653,13 @@ def _run_ast(
             cwd=root,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=budget,
             check=False,
         )
     except subprocess.TimeoutExpired:
+        # The budget is the engine's own two seconds or whatever the request has left;
+        # only the latter is the caller's deadline rather than an engine timeout.
+        scope.checkpoint()
         return [], "timeout"
     except OSError:
         return [], "unavailable"
@@ -727,6 +732,10 @@ def search(
     # on the command line, not a network-facing surface, so it intentionally
     # never has a code-ACL layer to narrow against.
     code_allowed: set[str] | None = None,
+    # `allowed` is a native-narrowed candidate hint (see ForgejoAuth.visible_repositories),
+    # not the viewer's full list: an empty hint then says nothing about the viewer, so the
+    # inferred-intent field is kept exactly as it would be for a signed-in viewer.
+    narrowed: bool = False,
 ) -> dict:
     q = parse_query(query)
     limit = max(1, min(int(limit), 100))
@@ -735,11 +744,12 @@ def search(
     if not query.strip():
         return {
             "query": q.raw, "mode": q.mode, "results": [],
-            **({"inferred": "text"} if allowed else {}),
+            **({"inferred": "text"} if allowed or narrowed else {}),
             "coverage": coverage,
         }
 
     code_scope = allowed if code_allowed is None else (allowed & code_allowed)
+    scope.checkpoint()
     hits: list[SearchHit] = []
     candidate_limit = stages["lexical_candidates"]["limit"]
     with database.connection() as connection:
@@ -756,6 +766,7 @@ def search(
             symbol_hits = _symbol_hits(connection, q, code_scope, limit + 1)
             stages["symbol_hits"]["state"] = _limit_state(len(symbol_hits), limit)
             hits.extend(symbol_hits[:limit])
+        scope.checkpoint()
         rows = []
         terms = _candidate_terms(q) if q.text and q.mode != "file" else []
         if terms:
@@ -767,6 +778,7 @@ def search(
             hits.extend(_reference_hits(rows, q, definitions, limit + 1))
         else:
             hits.extend(_fts_hits(rows, q, limit + 1))
+        scope.checkpoint()
         if q.ast_candidate:
             ast_rows = rows
             if not ast_rows:
@@ -782,6 +794,7 @@ def search(
             stages["ast_files"]["state"] = files_state
             hits.extend(ast_hits)
 
+    scope.checkpoint()
     seen: set[tuple] = set()
     merged: list[dict] = []
     for hit in sorted(hits, key=lambda item: -item.score):
@@ -812,7 +825,7 @@ def search(
     return {
         "query": q.raw,
         "mode": q.mode,
-        **({"inferred": inferred} if allowed else {}),
+        **({"inferred": inferred} if allowed or narrowed else {}),
         "results": merged[:limit],
         "coverage": coverage,
     }

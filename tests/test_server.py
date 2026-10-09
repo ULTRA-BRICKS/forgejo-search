@@ -19,7 +19,14 @@ from hypersearch.server import SearchServer
 
 
 class FakeAuth:
-    def visible_repositories(self, cookie: str):
+    def session_authenticated(self, cookie: str):
+        return self.visible_repositories(cookie)[0]
+
+    @contextmanager
+    def session_watch(self, cookie: str):
+        yield threading.Event()
+
+    def visible_repositories(self, cookie: str, repo=None):
         if cookie == "visibility-error":
             raise VisibilityUnavailable("upstream visibility failed")
         if cookie not in {"session=alice", "session=code-visibility-error"}:
@@ -269,7 +276,14 @@ class TwoRepoAuth:
     def __init__(self):
         self.code_calls: list[set[str]] = []
 
-    def visible_repositories(self, cookie: str):
+    def session_authenticated(self, cookie: str):
+        return cookie == "session=alice"
+
+    @contextmanager
+    def session_watch(self, cookie: str):
+        yield threading.Event()
+
+    def visible_repositories(self, cookie: str, repo=None):
         if cookie != "session=alice":
             return False, set()
         return True, {"acme/open", "acme/locked"}
